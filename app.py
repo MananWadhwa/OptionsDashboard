@@ -432,6 +432,7 @@ with page_tab1:
             bg_color     = 'rgba(34,197,94,0.07)' if target_hit else 'rgba(255,255,255,0.03)'
             pnl_color    = '#22c55e' if pd.notna(pnl) and pnl >= 0 else '#f87171'
             side_color   = '#f87171' if side.upper() in ('SHORT', 'CREDIT') else '#34d399'
+            price_color  = '#22c55e' if target_hit else '#e2e8f0'
 
             badge = '<span style="background:#22c55e;color:#000;font-size:0.6em;padding:2px 7px;border-radius:4px;font-weight:bold;vertical-align:middle;">TARGET HIT</span>' if target_hit else ''
 
