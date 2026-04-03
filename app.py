@@ -444,45 +444,39 @@ with page_tab1:
             move_str    = f"${move:+.2f}"    if pd.notna(move) and move == move else "—"
 
             return f"""
-<div style="border:1.5px solid {border_color};border-radius:12px;padding:14px 16px;
-            background:{bg_color};">
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
-    <div style="font-size:0.95em;font-weight:600;line-height:1.4;">{option_html}</div>
-    <div style="text-align:right;flex-shrink:0;margin-left:8px;">
-      <span style="color:{side_color};font-size:0.72em;font-weight:700;text-transform:uppercase;">{side}</span>
-      <span style="color:#6B7280;font-size:0.72em;margin-left:4px;">×{qty}</span>
-    </div>
-  </div>
-  {('<div style="margin-bottom:6px;">' + badge + '</div>') if target_hit else ''}
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 8px;margin-top:8px;">
-    <div>
-      <div style="color:#6B7280;font-size:0.62em;text-transform:uppercase;">Entry</div>
-      <div style="color:#9CA3AF;font-size:0.88em;font-weight:600;">{entry_str}</div>
-    </div>
-    <div>
-      <div style="color:#6B7280;font-size:0.62em;text-transform:uppercase;">Current</div>
-      <div style="color:#e2e8f0;font-size:0.88em;font-weight:600;">{current_str}</div>
-    </div>
-    <div>
-      <div style="color:#6B7280;font-size:0.62em;text-transform:uppercase;">Target</div>
-      <div style="color:#C084FC;font-size:1em;font-weight:700;">{target_str}</div>
-    </div>
-  </div>
-  <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.07);
-              display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;">
-    <div>
-      <div style="color:#6B7280;font-size:0.62em;text-transform:uppercase;">Unreal. P&L</div>
-      <div style="color:{pnl_color};font-size:1em;font-weight:700;">{pnl_str}
-        <span style="font-size:0.7em;opacity:0.8;">{pnl_pct_str}</span>
+<div style="border:1.5px solid {border_color};border-radius:12px;padding:10px 14px;
+            background:{bg_color};display:flex;justify-content:space-between;gap:10px;">
+  <!-- LEFT: option label + meta stats -->
+  <div style="flex:1;min-width:0;">
+    <div style="font-size:0.9em;font-weight:600;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{option_html}</div>
+    <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;">
+      <div>
+        <div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Entry</div>
+        <div style="color:#9CA3AF;font-size:0.82em;font-weight:600;">{entry_str}</div>
+      </div>
+      <div>
+        <div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Days</div>
+        <div style="color:#e2e8f0;font-size:0.82em;font-weight:600;">{dte_str}</div>
+      </div>
+      <div>
+        <div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Move</div>
+        <div style="color:#60A5FA;font-size:0.82em;font-weight:600;">{move_str}</div>
       </div>
     </div>
+  </div>
+  <!-- RIGHT: prices + P&L -->
+  <div style="text-align:right;flex-shrink:0;display:flex;flex-direction:column;justify-content:space-between;">
     <div>
-      <div style="color:#6B7280;font-size:0.62em;text-transform:uppercase;">Days → Target</div>
-      <div style="color:#e2e8f0;font-size:0.88em;font-weight:600;">{dte_str}</div>
+      <div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">
+        <span style="color:{side_color};font-weight:700;">{side}</span> ×{qty}
+        {'&nbsp;' + badge if target_hit else ''}
+      </div>
+      <div style="color:{price_color};font-size:1.15em;font-weight:700;line-height:1.2;">{current_str}</div>
+      <div style="color:#C084FC;font-size:0.85em;font-weight:700;">→ {target_str}</div>
     </div>
-    <div style="grid-column:1/-1;">
-      <div style="color:#6B7280;font-size:0.62em;text-transform:uppercase;">Underlying Move Needed</div>
-      <div style="color:#60A5FA;font-size:0.88em;font-weight:600;">{move_str}</div>
+    <div style="margin-top:6px;">
+      <div style="color:{pnl_color};font-size:0.95em;font-weight:700;">{pnl_str}</div>
+      <div style="color:{pnl_color};font-size:0.7em;opacity:0.8;">{pnl_pct_str}</div>
     </div>
   </div>
 </div>"""
