@@ -759,13 +759,40 @@ def watchlist_card_html(row, data):
 with page_tab2:
     watchlist = load_watchlist()
 
-    # Fetch prices
+    # Live mode toggle (off by default, resets when page is closed)
+    if 'wl_live' not in st.session_state:
+        st.session_state['wl_live'] = False
+    if 'wl_interval' not in st.session_state:
+        st.session_state['wl_interval'] = 30
+
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 4])
+    live_on = ctrl1.toggle("Live Quotes", value=st.session_state['wl_live'], key="wl_live_toggle")
+    st.session_state['wl_live'] = live_on
+
+    if live_on:
+        interval = ctrl2.selectbox("Refresh every", [15, 30, 60, 120], index=1, format_func=lambda x: f"{x}s", key="wl_interval_sel")
+        st.session_state['wl_interval'] = interval
+
     if not watchlist.empty:
         occ_list = [watchlist_occ(r) for _, r in watchlist.iterrows()]
+
+        # Live mode bypasses cache; manual mode uses 2-min cache
+        if live_on:
+            fetch_watchlist_prices.clear()
+
         with st.spinner("Fetching watchlist prices..."):
             prices = fetch_watchlist_prices(tuple(occ_list))
 
-        # Display cards
+        # Last updated timestamp
+        updated_str = datetime.now().strftime("%H:%M:%S")
+        status_color = '#22c55e' if live_on else '#6B7280'
+        live_badge = (
+            f'<span style="background:{status_color};color:#000;font-size:0.65em;'
+            f'padding:2px 8px;border-radius:10px;font-weight:700;">{"LIVE" if live_on else "DELAYED"}</span>'
+            f'&nbsp;<span style="color:#6B7280;font-size:0.72em;">Updated {updated_str}</span>'
+        )
+        st.markdown(live_badge, unsafe_allow_html=True)
+
         cards_html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px;width:100%;">'
         for i, (_, row) in enumerate(watchlist.iterrows()):
             occ = occ_list[i]
@@ -773,7 +800,21 @@ with page_tab2:
         cards_html += '</div>'
         st.markdown(cards_html, unsafe_allow_html=True)
 
-        if st.button("Refresh Watchlist", key="wl_refresh"):
+        col_a, col_b = st.columns([1, 5])
+        if col_a.button("Refresh", key="wl_refresh"):
+            fetch_watchlist_prices.clear()
+            st.rerun()
+
+        # Auto-refresh loop when live mode is on
+        if live_on:
+            countdown = st.empty()
+            for i in range(st.session_state['wl_interval'], 0, -1):
+                countdown.markdown(
+                    f'<span style="color:#6B7280;font-size:0.75em;">Next refresh in {i}s</span>',
+                    unsafe_allow_html=True
+                )
+                time.sleep(1)
+            countdown.empty()
             fetch_watchlist_prices.clear()
             st.rerun()
     else:
