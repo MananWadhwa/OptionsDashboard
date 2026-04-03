@@ -13,6 +13,56 @@ import time
 
 st.set_page_config(page_title="Options Tracker", layout="wide")
 
+st.markdown("""
+<style>
+/* ── Hide Streamlit chrome ── */
+#MainMenu, header, footer { display: none !important; }
+
+/* ── Tighten page padding on mobile ── */
+.block-container {
+    padding-top: 0.75rem !important;
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+    max-width: 100% !important;
+}
+
+/* ── Compact tab bar ── */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px;
+}
+.stTabs [data-baseweb="tab"] {
+    padding: 6px 12px !important;
+    font-size: 0.82em !important;
+}
+
+/* ── Metric tiles smaller on mobile ── */
+[data-testid="stMetric"] {
+    padding: 6px 10px !important;
+}
+[data-testid="stMetricLabel"] { font-size: 0.75em !important; }
+[data-testid="stMetricValue"] { font-size: 1.2em !important; }
+
+/* ── Responsive cards: full width on small screens ── */
+@media (max-width: 640px) {
+    .block-container {
+        padding-left: 0.4rem !important;
+        padding-right: 0.4rem !important;
+    }
+    div[style*="display:inline-block"] {
+        min-width: calc(50% - 16px) !important;
+        max-width: calc(50% - 16px) !important;
+        font-size: 0.82em !important;
+    }
+}
+
+/* ── Expander header more compact ── */
+.streamlit-expanderHeader {
+    font-size: 0.88em !important;
+    padding: 6px 10px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # --- BLACK-SCHOLES GREEKS ENGINE ---
 def calculate_greeks(S, K, T, r, sigma, option_type):
     """Calculates Delta, Theta, and Gamma using Black-Scholes."""
@@ -186,7 +236,11 @@ def save_account_to_file(all_positions_df, account):
     out.to_csv(filepath, index=False)
 
 # --- MAIN DASHBOARD ---
-st.title("Options Portfolio & Target Projections")
+st.markdown(
+    '<div style="font-size:1.1em;font-weight:700;color:#e2e8f0;'
+    'padding:4px 0 10px;letter-spacing:0.01em;">Options Tracker</div>',
+    unsafe_allow_html=True
+)
 page_tab1, page_tab2, page_tab3 = st.tabs(["Portfolio", "Watchlist", "Sentiment"])
 
 with page_tab1:
@@ -946,7 +1000,7 @@ def gauge_html(score, label, title, sub_rows):
 </div>"""
 
 with page_tab3:
-    st.subheader("Market Sentiment")
+    st.markdown('<div style="font-size:1em;font-weight:700;color:#e2e8f0;padding:2px 0 8px;">Market Sentiment</div>', unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
 
