@@ -42,16 +42,11 @@ st.markdown("""
 [data-testid="stMetricLabel"] { font-size: 0.75em !important; }
 [data-testid="stMetricValue"] { font-size: 1.2em !important; }
 
-/* ── Responsive cards: full width on small screens ── */
+/* ── Responsive cards: tighter padding on small screens ── */
 @media (max-width: 640px) {
     .block-container {
         padding-left: 0.4rem !important;
         padding-right: 0.4rem !important;
-    }
-    div[style*="display:inline-block"] {
-        min-width: calc(50% - 16px) !important;
-        max-width: calc(50% - 16px) !important;
-        font-size: 0.82em !important;
     }
 }
 
@@ -450,8 +445,7 @@ with page_tab1:
 
             return f"""
 <div style="border:1.5px solid {border_color};border-radius:12px;padding:14px 16px;
-            background:{bg_color};display:inline-block;vertical-align:top;
-            margin:6px;min-width:210px;max-width:260px;">
+            background:{bg_color};">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
     <div style="font-size:0.95em;font-weight:600;line-height:1.4;">{option_html}</div>
     <div style="text-align:right;flex-shrink:0;margin-left:8px;">
@@ -504,7 +498,7 @@ with page_tab1:
                 f'{account} &nbsp;<span style="color:{pnl_col};font-size:0.95em;">${acct_pnl:+,.2f}</span></div>',
                 unsafe_allow_html=True
             )
-            cards_html = '<div style="display:flex;flex-wrap:wrap;gap:2px;">'
+            cards_html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;width:100%;">'
             for _, row in acct_df.iterrows():
                 cards_html += position_card_html(row)
             cards_html += '</div>'
@@ -747,8 +741,7 @@ def watchlist_card_html(row, data):
 
     return f"""
 <div style="border:1.5px solid {border_color};border-radius:10px;padding:14px 18px;
-            background:{bg_color};min-width:180px;max-width:240px;display:inline-block;
-            vertical-align:top;margin:6px;">
+            background:{bg_color};">
   <div style="font-size:1.1em;font-weight:bold;color:#e2e8f0;">
     <span style="color:#60A5FA">{ticker}</span>
     <span style="color:{type_color};margin-left:4px">{opt_type}</span>
@@ -782,7 +775,7 @@ with page_tab2:
             prices = fetch_watchlist_prices(tuple(occ_list))
 
         # Display cards
-        cards_html = '<div style="display:flex;flex-wrap:wrap;gap:4px;">'
+        cards_html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px;width:100%;">'
         for i, (_, row) in enumerate(watchlist.iterrows()):
             occ = occ_list[i]
             cards_html += watchlist_card_html(row, prices.get(occ))
