@@ -9,6 +9,7 @@ import glob
 import os
 import urllib.request
 import json
+import time
 
 st.set_page_config(page_title="Options Tracker", layout="wide")
 
@@ -76,51 +77,90 @@ def format_occ_html(plain_option):
     )
 
 # --- DATA FETCHING ---
+def _yf_fetch_with_retry(fn, retries=3, base_delay=5):
+    """Calls fn(), retrying on rate-limit errors with exponential backoff."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if "too many requests" in str(e).lower() or "rate limit" in str(e).lower():
+                if attempt < retries - 1:
+                    time.sleep(base_delay * (2 ** attempt))
+                else:
+                    raise
+            else:
+                raise
+
 @st.cache_data(ttl=120)
 def fetch_option_data(occ_list):
-    """Fetches delayed prices and IV from Yahoo Finance."""
+    """Fetches delayed prices and IV from Yahoo Finance, batched by ticker."""
     results = []
-    r = 0.045  # Assuming a 4.5% risk-free rate
-    
+    r = 0.045
+
+    # Group OCCs by ticker so we fetch each ticker's spot/chain only once
+    from collections import defaultdict
+    by_ticker = defaultdict(list)
     for occ in occ_list:
         parsed = parse_occ(occ)
-        if not parsed:
-            continue
-            
-        ticker, expiration, opt_type, strike = parsed
-        
+        if parsed:
+            by_ticker[parsed[0]].append((occ, parsed))
+
+    for i, (ticker_sym, contracts) in enumerate(by_ticker.items()):
+        # Small delay between tickers to avoid rate limiting
+        if i > 0:
+            time.sleep(0.5)
         try:
-            underlying_ticker = yf.Ticker(ticker)
-            spot_price = underlying_ticker.history(period="1d")['Close'].iloc[-1]
-            
-            chain = underlying_ticker.option_chain(expiration)
-            options = chain.calls if opt_type == 'C' else chain.puts
-            
-            contract = options[options['strike'] == strike]
+            underlying_ticker = yf.Ticker(ticker_sym)
+            spot_price = _yf_fetch_with_retry(
+                lambda t=underlying_ticker: t.history(period="1d")['Close'].iloc[-1]
+            )
 
-            if contract.empty:
-                st.warning(f"Could not find contract for {occ}. The strike price {strike} may be too far from the current spot price of {spot_price}, and therefore not returned by the data provider.")
-                continue
+            # Fetch each unique expiration once per ticker
+            chains = {}
+            for occ, (_, expiration, _, _) in contracts:
+                if expiration not in chains:
+                    try:
+                        chains[expiration] = _yf_fetch_with_retry(
+                            lambda t=underlying_ticker, e=expiration: t.option_chain(e)
+                        )
+                    except Exception as e:
+                        st.warning(f"Could not fetch chain for {ticker_sym} {expiration}: {e}")
+                        chains[expiration] = None
 
-            last_price = contract['lastPrice'].values[0]
-            iv = contract['impliedVolatility'].values[0]
+            for occ, (_, expiration, opt_type, strike) in contracts:
+                chain = chains.get(expiration)
+                if chain is None:
+                    continue
+                try:
+                    options  = chain.calls if opt_type == 'C' else chain.puts
+                    contract = options[options['strike'] == strike]
 
-            days_to_exp = (datetime.strptime(expiration, "%Y-%m-%d") - datetime.now()).days
-            T = max(days_to_exp / 365.0, 0.001)
+                    if contract.empty:
+                        st.warning(f"Could not find contract for {occ}. Strike {strike} may not be available (spot: {spot_price:.2f}).")
+                        continue
 
-            delta, theta, _ = calculate_greeks(spot_price, strike, T, r, iv, opt_type)
+                    last_price = contract['lastPrice'].values[0]
+                    iv         = contract['impliedVolatility'].values[0]
 
-            results.append({
-                "OCC_Symbol": occ,
-                "Underlying_Price": spot_price,
-                "Current_Price": last_price,
-                "Delta": delta,
-                "Theta": theta,
-                "DTE": days_to_exp
-            })
+                    days_to_exp = (datetime.strptime(expiration, "%Y-%m-%d") - datetime.now()).days
+                    T = max(days_to_exp / 365.0, 0.001)
+
+                    delta, theta, _ = calculate_greeks(spot_price, strike, T, r, iv, opt_type)
+
+                    results.append({
+                        "OCC_Symbol":       occ,
+                        "Underlying_Price": spot_price,
+                        "Current_Price":    last_price,
+                        "Delta":            delta,
+                        "Theta":            theta,
+                        "DTE":              days_to_exp
+                    })
+                except Exception as e:
+                    st.warning(f"Could not process {occ}: {e}")
+
         except Exception as e:
-            st.warning(f"Could not fetch data for {occ}. Error: {e}")
-            
+            st.warning(f"Could not fetch data for {ticker_sym}: {e}")
+
     return pd.DataFrame(results)
 
 def construct_occ_from_row(row):
