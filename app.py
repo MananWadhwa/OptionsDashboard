@@ -471,7 +471,7 @@ with page_tab1:
     </div>
     <div>
       <div style="color:#6B7280;font-size:0.62em;text-transform:uppercase;">Target</div>
-      <div style="color:#A78BFA;font-size:0.88em;font-weight:600;">{target_str}</div>
+      <div style="color:#C084FC;font-size:1em;font-weight:700;">{target_str}</div>
     </div>
   </div>
   <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.07);
@@ -762,12 +762,12 @@ def watchlist_card_html(row, data):
     <div>
       <div style="color:#9CA3AF;font-size:0.68em;text-transform:uppercase;">Option Price</div>
       <div style="font-size:1.25em;font-weight:bold;color:{price_color};">{option_price_str}</div>
-      <div style="color:#6B7280;font-size:0.72em;">Target ${target_disp}</div>
+      <div style="color:#C084FC;font-size:0.85em;font-weight:700;">Target ${target_disp}</div>
     </div>
     <div style="text-align:right;">
       <div style="color:#9CA3AF;font-size:0.68em;text-transform:uppercase;">{ticker} Price</div>
       <div style="font-size:1.1em;font-weight:bold;color:#e2e8f0;">{spot_str}</div>
-      <div style="color:#6B7280;font-size:0.72em;">Need {stock_target_str}</div>
+      <div style="color:#FCD34D;font-size:0.85em;font-weight:700;">Need {stock_target_str}</div>
     </div>
   </div>
 </div>"""
