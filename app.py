@@ -13,6 +13,21 @@ import time
 
 st.set_page_config(page_title="Options Tracker", layout="wide")
 
+# PWA: manifest + service worker registration + iOS meta tags
+st.markdown("""
+<link rel="manifest" href="/app/static/manifest.json">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Options">
+<meta name="theme-color" content="#0e1117">
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/app/static/sw.js');
+  }
+</script>
+""", unsafe_allow_html=True)
+
 st.markdown("""
 <style>
 /* ── Hide Streamlit chrome ── */
@@ -277,6 +292,19 @@ with page_tab1:
         st.error(f"An error occurred while reading position files: {e}")
         st.stop()
 
+    # Live mode toggle for Portfolio
+    if 'pf_live' not in st.session_state:
+        st.session_state['pf_live'] = False
+    if 'pf_interval' not in st.session_state:
+        st.session_state['pf_interval'] = 30
+
+    pf_ctrl1, pf_ctrl2, pf_ctrl3 = st.columns([2, 2, 4])
+    pf_live_on = pf_ctrl1.toggle("Live Quotes", value=st.session_state['pf_live'], key="pf_live_toggle")
+    st.session_state['pf_live'] = pf_live_on
+    if pf_live_on:
+        pf_interval = pf_ctrl2.selectbox("Refresh every", [15, 30, 60, 120], index=1, format_func=lambda x: f"{x}s", key="pf_interval_sel")
+        st.session_state['pf_interval'] = pf_interval
+
     # Account filter
     accounts = ["All"] + positions['Account'].unique().tolist()
     selected_accounts = st.multiselect("Filter by Account", options=accounts, default=["All"])
@@ -285,6 +313,9 @@ with page_tab1:
         filtered_positions = positions
     else:
         filtered_positions = positions[positions['Account'].isin(selected_accounts)]
+
+    if pf_live_on:
+        fetch_option_data.clear()
 
     with st.spinner("Fetching latest market data..."):
         market_data = fetch_option_data(filtered_positions['OCC_Symbol'].tolist())
@@ -495,9 +526,29 @@ with page_tab1:
             cards_html += '</div>'
             st.markdown(cards_html, unsafe_allow_html=True)
 
-        st.caption("Data is delayed. Greeks are Black-Scholes approximations.")
+        pf_updated_str = datetime.now().strftime("%H:%M:%S")
+        pf_status_color = '#22c55e' if pf_live_on else '#6B7280'
+        pf_live_badge = (
+            f'<span style="background:{pf_status_color};color:#000;font-size:0.65em;'
+            f'padding:2px 8px;border-radius:10px;font-weight:700;">{"LIVE" if pf_live_on else "DELAYED"}</span>'
+            f'&nbsp;<span style="color:#6B7280;font-size:0.72em;">Updated {pf_updated_str}</span>'
+        )
+        st.markdown(pf_live_badge, unsafe_allow_html=True)
+        st.caption("Greeks are Black-Scholes approximations.")
 
         if st.button("Refresh Market Data"):
+            fetch_option_data.clear()
+            st.rerun()
+
+        if pf_live_on:
+            pf_countdown = st.empty()
+            for i in range(st.session_state['pf_interval'], 0, -1):
+                pf_countdown.markdown(
+                    f'<span style="color:#6B7280;font-size:0.75em;">Next refresh in {i}s</span>',
+                    unsafe_allow_html=True
+                )
+                time.sleep(1)
+            pf_countdown.empty()
             fetch_option_data.clear()
             st.rerun()
 
@@ -622,7 +673,7 @@ with page_tab1:
 # --- WATCHLIST TAB ---
 # =====================================================================
 WATCHLIST_FILE = "positions/watchlist.csv"
-WATCHLIST_COLS = ['Ticker', 'ExpirationYYMMDD', 'OptionType', 'Strike', 'TargetPrice', 'Intent', 'Label']
+WATCHLIST_COLS = ['Ticker', 'ExpirationYYMMDD', 'OptionType', 'Strike', 'TargetPrice', 'Intent', 'Label', 'ItemType']
 
 @st.cache_data(ttl=120)
 def fetch_watchlist_prices(occ_list):
@@ -661,6 +712,9 @@ def load_watchlist():
     for col in WATCHLIST_COLS:
         if col not in df.columns:
             df[col] = '' if col in ('Label', 'Intent') else np.nan
+    # Backward compat: rows without ItemType are options
+    df['ItemType'] = df['ItemType'].fillna('option')
+    df.loc[df['ItemType'].str.strip() == '', 'ItemType'] = 'option'
     return df
 
 def save_watchlist(df):
@@ -756,6 +810,178 @@ def watchlist_card_html(row, data):
   </div>
 </div>"""
 
+@st.cache_data(ttl=120)
+def fetch_stock_prices(tickers):
+    """Fetches price, day change, and technical indicators for a tuple of stock tickers."""
+    results = {}
+    for ticker in tickers:
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="1y")
+            if hist.empty:
+                raise ValueError("No data returned")
+
+            close = hist['Close']
+
+            # Price & day change
+            price  = float(close.iloc[-1])
+            prev   = float(close.iloc[-2]) if len(close) >= 2 else price
+            change     = price - prev
+            change_pct = (change / prev * 100) if prev else 0
+
+            # EMA 50 & EMA 200
+            ema50  = float(close.ewm(span=50,  adjust=False).mean().iloc[-1])
+            ema200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1])
+
+            # Bollinger Bands (50-day SMA, 2× population stdev — matches TradingView default)
+            bb_window = 50
+            sma50    = close.rolling(bb_window).mean()
+            std50    = close.rolling(bb_window).std(ddof=0)
+            bb_upper = float((sma50 + 2 * std50).iloc[-1])
+            bb_lower = float((sma50 - 2 * std50).iloc[-1])
+
+            # RSI (14-period, Wilder's smoothing)
+            delta  = close.diff()
+            gain   = delta.clip(lower=0)
+            loss   = (-delta).clip(lower=0)
+            avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+            rs  = avg_gain.iloc[-1] / avg_loss.iloc[-1] if avg_loss.iloc[-1] != 0 else float('inf')
+            rsi = 100 - (100 / (1 + rs))
+
+            results[ticker] = {
+                'price': price, 'change': change, 'change_pct': change_pct,
+                'ema50': ema50, 'ema200': ema200,
+                'bb_upper': bb_upper, 'bb_lower': bb_lower,
+                'rsi': rsi,
+            }
+        except Exception:
+            results[ticker] = {
+                'price': None, 'change': None, 'change_pct': None,
+                'ema50': None, 'ema200': None,
+                'bb_upper': None, 'bb_lower': None,
+                'rsi': None,
+            }
+    return results
+
+def stock_card_html(row, data):
+    ticker = str(row['Ticker']).upper()
+    target = float(row['TargetPrice']) if pd.notna(row['TargetPrice']) and float(row['TargetPrice']) != 0 else None
+    intent = str(row['Intent']).strip().lower() if pd.notna(row['Intent']) and str(row['Intent']).strip() else 'buy'
+    label  = str(row['Label']) if pd.notna(row['Label']) and str(row['Label']).strip() else ''
+
+    price      = data.get('price')      if data else None
+    change     = data.get('change')     if data else None
+    change_pct = data.get('change_pct') if data else None
+    rsi        = data.get('rsi')        if data else None
+    bb_upper   = data.get('bb_upper')   if data else None
+    bb_lower   = data.get('bb_lower')   if data else None
+    ema50      = data.get('ema50')      if data else None
+    ema200     = data.get('ema200')     if data else None
+
+    # --- Signal detection ---
+    sell_signal = (price is not None and bb_upper is not None and rsi is not None
+                   and price > bb_upper and rsi > 80)
+    buy_signal  = (price is not None and bb_lower is not None and rsi is not None
+                   and price < bb_lower and rsi < 25)
+
+    # --- Alert target hit ---
+    hit = False
+    if price is not None and target is not None:
+        hit = price <= target if intent == 'buy' else price >= target
+
+    # --- Card colors: signal takes priority over alert hit ---
+    if sell_signal:
+        border_color = '#f87171'
+        bg_color     = 'rgba(248,113,113,0.10)'
+        price_color  = '#f87171'
+    elif buy_signal:
+        border_color = '#22c55e'
+        bg_color     = 'rgba(34,197,94,0.10)'
+        price_color  = '#22c55e'
+    elif hit:
+        border_color = '#22c55e'
+        bg_color     = 'rgba(34,197,94,0.08)'
+        price_color  = '#22c55e'
+    else:
+        border_color = '#3b82f6'
+        bg_color     = 'rgba(59,130,246,0.06)'
+        price_color  = '#60a5fa'
+
+    intent_label = 'Alert: Buy below' if intent == 'buy' else 'Alert: Sell above'
+    intent_color = '#34D399' if intent == 'buy' else '#F87171'
+    target_badge = '<span style="background:#22c55e;color:#000;font-size:0.65em;padding:2px 6px;border-radius:4px;margin-left:6px;font-weight:bold;">TARGET HIT</span>' if hit else ''
+
+    price_str = f"${price:,.2f}" if price is not None else "N/A"
+    if change is not None and change_pct is not None:
+        chg_color = '#22c55e' if change >= 0 else '#f87171'
+        chg_arrow = '▲' if change >= 0 else '▼'
+        chg_str = f'<span style="color:{chg_color};font-size:0.8em;">{chg_arrow} ${abs(change):,.2f} ({change_pct:+.2f}%)</span>'
+    else:
+        chg_str = '<span style="color:#6B7280;font-size:0.8em;">N/A</span>'
+
+    target_row = ''
+    if target is not None:
+        target_disp = int(target) if target == int(target) else target
+        target_row = f'<div style="color:{intent_color};font-size:0.75em;margin-top:3px;font-weight:600;">{intent_label} ${target_disp} {target_badge}</div>'
+
+    # Signal badge
+    if sell_signal:
+        signal_badge = '<span style="background:#f87171;color:#000;font-size:0.65em;padding:2px 8px;border-radius:4px;font-weight:bold;">SELL SIGNAL</span>'
+    elif buy_signal:
+        signal_badge = '<span style="background:#22c55e;color:#000;font-size:0.65em;padding:2px 8px;border-radius:4px;font-weight:bold;">BUY SIGNAL</span>'
+    else:
+        signal_badge = ''
+
+    # RSI color
+    if rsi is not None:
+        rsi_color = '#f87171' if rsi > 70 else ('#22c55e' if rsi < 30 else '#e2e8f0')
+        rsi_str   = f'<span style="color:{rsi_color};font-weight:700;">{rsi:.1f}</span>'
+    else:
+        rsi_str = '<span style="color:#6B7280;">N/A</span>'
+
+    def fmt(v):
+        return f"${v:,.2f}" if v is not None else "N/A"
+
+    # EMA relationship hint
+    ema_hint = ''
+    if ema50 is not None and ema200 is not None:
+        if ema50 > ema200:
+            ema_hint = ' <span style="color:#22c55e;font-size:0.7em;">▲ Bull</span>'
+        else:
+            ema_hint = ' <span style="color:#f87171;font-size:0.7em;">▼ Bear</span>'
+
+    indicators_html = f"""
+  <div style="margin-top:10px;padding-top:8px;border-top:1px solid #2d3748;">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:0.75em;">
+      <div><span style="color:#6B7280;">RSI(14)</span>&nbsp;{rsi_str}</div>
+      <div><span style="color:#6B7280;">BB Upper</span>&nbsp;<span style="color:#e2e8f0;">{fmt(bb_upper)}</span></div>
+      <div><span style="color:#6B7280;">EMA 50</span>&nbsp;<span style="color:#A78BFA;">{fmt(ema50)}</span>{ema_hint}</div>
+      <div><span style="color:#6B7280;">BB Lower</span>&nbsp;<span style="color:#e2e8f0;">{fmt(bb_lower)}</span></div>
+      <div><span style="color:#6B7280;">EMA 200</span>&nbsp;<span style="color:#A78BFA;">{fmt(ema200)}</span></div>
+    </div>
+  </div>"""
+
+    return f"""
+<div style="border:1.5px solid {border_color};border-radius:10px;padding:14px 18px;
+            background:{bg_color};">
+  <div style="display:flex;align-items:center;justify-content:space-between;">
+    <div style="font-size:1.1em;font-weight:bold;">
+      <span style="color:#60A5FA">{ticker}</span>
+      <span style="color:#6B7280;font-size:0.7em;margin-left:6px;">STOCK</span>
+    </div>
+    {signal_badge}
+  </div>
+  {"<div style='color:#9CA3AF;font-size:0.75em;margin-top:2px;'>" + label + "</div>" if label else ""}
+  <div style="margin-top:8px;">
+    <div style="color:#9CA3AF;font-size:0.68em;text-transform:uppercase;">Price</div>
+    <div style="font-size:1.35em;font-weight:bold;color:{price_color};line-height:1.2;">{price_str}</div>
+    <div style="margin-top:2px;">{chg_str}</div>
+    {target_row}
+  </div>
+  {indicators_html}
+</div>"""
+
 with page_tab2:
     watchlist = load_watchlist()
 
@@ -774,14 +1000,26 @@ with page_tab2:
         st.session_state['wl_interval'] = interval
 
     if not watchlist.empty:
-        occ_list = [watchlist_occ(r) for _, r in watchlist.iterrows()]
+        option_rows = watchlist[watchlist['ItemType'] == 'option']
+        stock_rows  = watchlist[watchlist['ItemType'] == 'stock']
+
+        option_occs = {idx: watchlist_occ(row) for idx, row in option_rows.iterrows()}
+        stock_tickers = tuple(stock_rows['Ticker'].str.upper().unique()) if not stock_rows.empty else ()
 
         # Live mode bypasses cache; manual mode uses 2-min cache
         if live_on:
             fetch_watchlist_prices.clear()
+            fetch_stock_prices.clear()
 
-        with st.spinner("Fetching watchlist prices..."):
-            prices = fetch_watchlist_prices(tuple(occ_list))
+        option_prices = {}
+        if not option_rows.empty:
+            with st.spinner("Fetching option prices..."):
+                option_prices = fetch_watchlist_prices(tuple(option_occs.values()))
+
+        stock_price_data = {}
+        if stock_tickers:
+            with st.spinner("Fetching stock prices..."):
+                stock_price_data = fetch_stock_prices(stock_tickers)
 
         # Last updated timestamp
         updated_str = datetime.now().strftime("%H:%M:%S")
@@ -794,15 +1032,20 @@ with page_tab2:
         st.markdown(live_badge, unsafe_allow_html=True)
 
         cards_html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px;width:100%;">'
-        for i, (_, row) in enumerate(watchlist.iterrows()):
-            occ = occ_list[i]
-            cards_html += watchlist_card_html(row, prices.get(occ))
+        for idx, row in watchlist.iterrows():
+            if row['ItemType'] == 'stock':
+                ticker = str(row['Ticker']).upper()
+                cards_html += stock_card_html(row, stock_price_data.get(ticker))
+            else:
+                occ = option_occs.get(idx)
+                cards_html += watchlist_card_html(row, option_prices.get(occ))
         cards_html += '</div>'
         st.markdown(cards_html, unsafe_allow_html=True)
 
         col_a, col_b = st.columns([1, 5])
         if col_a.button("Refresh", key="wl_refresh"):
             fetch_watchlist_prices.clear()
+            fetch_stock_prices.clear()
             st.rerun()
 
         # Auto-refresh loop when live mode is on
@@ -816,79 +1059,137 @@ with page_tab2:
                 time.sleep(1)
             countdown.empty()
             fetch_watchlist_prices.clear()
+            fetch_stock_prices.clear()
             st.rerun()
     else:
-        st.info("No options in your watchlist. Add one below.")
+        st.info("No items in your watchlist. Add one below.")
 
     st.divider()
     with st.expander("Manage Watchlist", expanded=watchlist.empty):
         wl_add, wl_edit, wl_delete = st.tabs(["Add", "Edit", "Delete"])
 
         with wl_add:
-            with st.form("wl_add_form"):
-                c1, c2, c3, c4, c5, c6 = st.columns(6)
-                wl_ticker  = c1.text_input("Ticker", placeholder="NVDA").strip().upper()
-                wl_exp     = c2.text_input("Expiry YYMMDD", placeholder="270115")
-                wl_type    = c3.selectbox("Type", ["P", "C"])
-                wl_strike  = c4.number_input("Strike", min_value=0.01, step=0.5, value=100.0)
-                wl_target  = c5.number_input("Target Price", min_value=0.0, step=0.01, value=0.0)
-                wl_intent  = c6.selectbox("Intent", ["Buy", "Sell"])
-                wl_label   = st.text_input("Label (optional)", placeholder="e.g. earnings play")
+            wl_add_kind = st.radio("Add", ["Option", "Stock"], horizontal=True, key="wl_add_kind")
 
-                if st.form_submit_button("Add to Watchlist"):
-                    if not wl_ticker or not wl_exp:
-                        st.error("Ticker and Expiry are required.")
-                    else:
-                        new_wl = pd.DataFrame([{
-                            'Ticker': wl_ticker, 'ExpirationYYMMDD': int(wl_exp),
-                            'OptionType': wl_type, 'Strike': float(wl_strike),
-                            'TargetPrice': float(wl_target),
-                            'Intent': wl_intent.lower(),
-                            'Label': wl_label.strip()
-                        }])
-                        save_watchlist(pd.concat([watchlist, new_wl], ignore_index=True))
-                        fetch_watchlist_prices.clear()
-                        st.success(f"Added {wl_ticker} {wl_type} ${wl_strike} to watchlist.")
-                        st.rerun()
+            if wl_add_kind == "Option":
+                with st.form("wl_add_option_form"):
+                    c1, c2, c3, c4, c5, c6 = st.columns(6)
+                    wl_ticker  = c1.text_input("Ticker", placeholder="NVDA").strip().upper()
+                    wl_exp     = c2.text_input("Expiry YYMMDD", placeholder="270115")
+                    wl_type    = c3.selectbox("Type", ["P", "C"])
+                    wl_strike  = c4.number_input("Strike", min_value=0.01, step=0.5, value=100.0)
+                    wl_target  = c5.number_input("Target Price", min_value=0.0, step=0.01, value=0.0)
+                    wl_intent  = c6.selectbox("Intent", ["Buy", "Sell"])
+                    wl_label   = st.text_input("Label (optional)", placeholder="e.g. earnings play")
+
+                    if st.form_submit_button("Add Option"):
+                        if not wl_ticker or not wl_exp:
+                            st.error("Ticker and Expiry are required.")
+                        else:
+                            new_wl = pd.DataFrame([{
+                                'Ticker': wl_ticker, 'ExpirationYYMMDD': int(wl_exp),
+                                'OptionType': wl_type, 'Strike': float(wl_strike),
+                                'TargetPrice': float(wl_target),
+                                'Intent': wl_intent.lower(),
+                                'Label': wl_label.strip(),
+                                'ItemType': 'option'
+                            }])
+                            save_watchlist(pd.concat([watchlist, new_wl], ignore_index=True))
+                            fetch_watchlist_prices.clear()
+                            st.success(f"Added {wl_ticker} {wl_type} ${wl_strike} to watchlist.")
+                            st.rerun()
+            else:
+                with st.form("wl_add_stock_form"):
+                    c1, c2, c3 = st.columns([2, 2, 2])
+                    wl_s_ticker = c1.text_input("Ticker", placeholder="MSFT").strip().upper()
+                    wl_s_target = c2.number_input("Alert Price (optional)", min_value=0.0, step=0.01, value=0.0)
+                    wl_s_intent = c3.selectbox("Alert Direction", ["Buy below", "Sell above"])
+                    wl_s_label  = st.text_input("Label (optional)", placeholder="e.g. support level")
+
+                    if st.form_submit_button("Add Stock"):
+                        if not wl_s_ticker:
+                            st.error("Ticker is required.")
+                        else:
+                            new_wl = pd.DataFrame([{
+                                'Ticker': wl_s_ticker,
+                                'ExpirationYYMMDD': np.nan,
+                                'OptionType': np.nan,
+                                'Strike': np.nan,
+                                'TargetPrice': float(wl_s_target) if wl_s_target else np.nan,
+                                'Intent': 'buy' if wl_s_intent == 'Buy below' else 'sell',
+                                'Label': wl_s_label.strip(),
+                                'ItemType': 'stock'
+                            }])
+                            save_watchlist(pd.concat([watchlist, new_wl], ignore_index=True))
+                            fetch_stock_prices.clear()
+                            st.success(f"Added {wl_s_ticker} to watchlist.")
+                            st.rerun()
 
         with wl_edit:
             if watchlist.empty:
                 st.info("No items to edit.")
             else:
-                wl_labels = [f"{r['Ticker']} {r['OptionType']} {r['ExpirationYYMMDD']} ${r['Strike']}" for _, r in watchlist.iterrows()]
+                def _wl_label(r):
+                    if str(r.get('ItemType', 'option')) == 'stock':
+                        return f"{r['Ticker']} (Stock)"
+                    return f"{r['Ticker']} {r['OptionType']} {r['ExpirationYYMMDD']} ${r['Strike']}"
+                wl_labels  = [_wl_label(r) for _, r in watchlist.iterrows()]
                 wl_sel     = st.selectbox("Select item", wl_labels, key="wl_edit_sel")
                 wl_sel_idx = wl_labels.index(wl_sel)
                 wl_row     = watchlist.iloc[wl_sel_idx]
+                wl_row_type = str(wl_row.get('ItemType', 'option'))
 
-                with st.form("wl_edit_form"):
-                    c1, c2, c3, c4, c5, c6 = st.columns(6)
-                    wl_e_ticker  = c1.text_input("Ticker", value=str(wl_row['Ticker'])).strip().upper()
-                    wl_e_exp     = c2.text_input("Expiry YYMMDD", value=str(int(wl_row['ExpirationYYMMDD'])))
-                    wl_e_type    = c3.selectbox("Type", ["P", "C"], index=0 if wl_row['OptionType'] == 'P' else 1)
-                    wl_e_strike  = c4.number_input("Strike", value=float(wl_row['Strike']), step=0.5)
-                    wl_e_target  = c5.number_input("Target Price", value=float(wl_row['TargetPrice']), step=0.01)
-                    cur_intent   = str(wl_row['Intent']).strip().lower() if pd.notna(wl_row['Intent']) and str(wl_row['Intent']).strip() else 'buy'
-                    wl_e_intent  = c6.selectbox("Intent", ["Buy", "Sell"], index=0 if cur_intent == 'buy' else 1)
-                    wl_e_label   = st.text_input("Label", value=str(wl_row['Label']) if pd.notna(wl_row['Label']) else '')
-
-                    if st.form_submit_button("Save Changes"):
-                        watchlist.at[wl_sel_idx, 'Ticker']           = wl_e_ticker
-                        watchlist.at[wl_sel_idx, 'ExpirationYYMMDD'] = int(wl_e_exp)
-                        watchlist.at[wl_sel_idx, 'OptionType']       = wl_e_type
-                        watchlist.at[wl_sel_idx, 'Strike']           = float(wl_e_strike)
-                        watchlist.at[wl_sel_idx, 'TargetPrice']      = float(wl_e_target)
-                        watchlist.at[wl_sel_idx, 'Intent']           = wl_e_intent.lower()
-                        watchlist.at[wl_sel_idx, 'Label']            = wl_e_label.strip()
-                        save_watchlist(watchlist)
-                        fetch_watchlist_prices.clear()
-                        st.success("Watchlist item updated.")
-                        st.rerun()
+                if wl_row_type == 'stock':
+                    with st.form("wl_edit_stock_form"):
+                        c1, c2, c3 = st.columns([2, 2, 2])
+                        wl_e_ticker = c1.text_input("Ticker", value=str(wl_row['Ticker'])).strip().upper()
+                        cur_target  = float(wl_row['TargetPrice']) if pd.notna(wl_row['TargetPrice']) else 0.0
+                        wl_e_target = c2.number_input("Alert Price", value=cur_target, step=0.01)
+                        cur_intent  = str(wl_row['Intent']).strip().lower() if pd.notna(wl_row['Intent']) else 'buy'
+                        wl_e_intent = c3.selectbox("Alert Direction", ["Buy below", "Sell above"], index=0 if cur_intent == 'buy' else 1)
+                        wl_e_label  = st.text_input("Label", value=str(wl_row['Label']) if pd.notna(wl_row['Label']) else '')
+                        if st.form_submit_button("Save Changes"):
+                            watchlist.at[wl_sel_idx, 'Ticker']      = wl_e_ticker
+                            watchlist.at[wl_sel_idx, 'TargetPrice'] = float(wl_e_target)
+                            watchlist.at[wl_sel_idx, 'Intent']      = 'buy' if wl_e_intent == 'Buy below' else 'sell'
+                            watchlist.at[wl_sel_idx, 'Label']       = wl_e_label.strip()
+                            save_watchlist(watchlist)
+                            fetch_stock_prices.clear()
+                            st.success("Watchlist item updated.")
+                            st.rerun()
+                else:
+                    with st.form("wl_edit_option_form"):
+                        c1, c2, c3, c4, c5, c6 = st.columns(6)
+                        wl_e_ticker  = c1.text_input("Ticker", value=str(wl_row['Ticker'])).strip().upper()
+                        wl_e_exp     = c2.text_input("Expiry YYMMDD", value=str(int(wl_row['ExpirationYYMMDD'])))
+                        wl_e_type    = c3.selectbox("Type", ["P", "C"], index=0 if wl_row['OptionType'] == 'P' else 1)
+                        wl_e_strike  = c4.number_input("Strike", value=float(wl_row['Strike']), step=0.5)
+                        wl_e_target  = c5.number_input("Target Price", value=float(wl_row['TargetPrice']), step=0.01)
+                        cur_intent   = str(wl_row['Intent']).strip().lower() if pd.notna(wl_row['Intent']) and str(wl_row['Intent']).strip() else 'buy'
+                        wl_e_intent  = c6.selectbox("Intent", ["Buy", "Sell"], index=0 if cur_intent == 'buy' else 1)
+                        wl_e_label   = st.text_input("Label", value=str(wl_row['Label']) if pd.notna(wl_row['Label']) else '')
+                        if st.form_submit_button("Save Changes"):
+                            watchlist.at[wl_sel_idx, 'Ticker']           = wl_e_ticker
+                            watchlist.at[wl_sel_idx, 'ExpirationYYMMDD'] = int(wl_e_exp)
+                            watchlist.at[wl_sel_idx, 'OptionType']       = wl_e_type
+                            watchlist.at[wl_sel_idx, 'Strike']           = float(wl_e_strike)
+                            watchlist.at[wl_sel_idx, 'TargetPrice']      = float(wl_e_target)
+                            watchlist.at[wl_sel_idx, 'Intent']           = wl_e_intent.lower()
+                            watchlist.at[wl_sel_idx, 'Label']            = wl_e_label.strip()
+                            save_watchlist(watchlist)
+                            fetch_watchlist_prices.clear()
+                            st.success("Watchlist item updated.")
+                            st.rerun()
 
         with wl_delete:
             if watchlist.empty:
                 st.info("No items to delete.")
             else:
-                wl_del_labels = [f"{r['Ticker']} {r['OptionType']} {r['ExpirationYYMMDD']} ${r['Strike']}" for _, r in watchlist.iterrows()]
+                def _wl_del_label(r):
+                    if str(r.get('ItemType', 'option')) == 'stock':
+                        return f"{r['Ticker']} (Stock)"
+                    return f"{r['Ticker']} {r['OptionType']} {r['ExpirationYYMMDD']} ${r['Strike']}"
+                wl_del_labels = [_wl_del_label(r) for _, r in watchlist.iterrows()]
                 wl_del_sel    = st.selectbox("Select item to remove", wl_del_labels, key="wl_del_sel")
                 wl_del_idx    = wl_del_labels.index(wl_del_sel)
 
@@ -896,11 +1197,26 @@ with page_tab2:
                 if st.button("Remove", type="primary", key="wl_del_btn"):
                     save_watchlist(watchlist.drop(index=wl_del_idx).reset_index(drop=True))
                     fetch_watchlist_prices.clear()
+                    fetch_stock_prices.clear()
                     st.success("Removed from watchlist.")
                     st.rerun()
 # =====================================================================
 # --- SENTIMENT TAB ---
 # =====================================================================
+
+@st.cache_data(ttl=60)
+def fetch_btc_price():
+    """Fetches current BTC-USD price from Yahoo Finance."""
+    try:
+        btc = yf.Ticker("BTC-USD")
+        hist = btc.history(period="2d")
+        price = float(hist['Close'].iloc[-1])
+        prev  = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else price
+        change = price - prev
+        change_pct = (change / prev * 100) if prev else 0
+        return {"price": price, "change": change, "change_pct": change_pct}
+    except Exception as e:
+        return {"error": str(e)}
 
 @st.cache_data(ttl=1800)  # cache 30 min
 def fetch_cnn_fear_greed():
@@ -1027,6 +1343,46 @@ def gauge_html(score, label, title, sub_rows):
 with page_tab3:
     st.markdown('<div style="font-size:1em;font-weight:700;color:#e2e8f0;padding:2px 0 8px;">Market Sentiment</div>', unsafe_allow_html=True)
 
+    # Live mode toggle for Sentiment
+    if 'sent_live' not in st.session_state:
+        st.session_state['sent_live'] = False
+    if 'sent_interval' not in st.session_state:
+        st.session_state['sent_interval'] = 30
+
+    sent_ctrl1, sent_ctrl2, sent_ctrl3 = st.columns([2, 2, 4])
+    sent_live_on = sent_ctrl1.toggle("Live Quotes", value=st.session_state['sent_live'], key="sent_live_toggle")
+    st.session_state['sent_live'] = sent_live_on
+    if sent_live_on:
+        sent_interval = sent_ctrl2.selectbox("Refresh every", [15, 30, 60, 120], index=1, format_func=lambda x: f"{x}s", key="sent_interval_sel")
+        st.session_state['sent_interval'] = sent_interval
+
+    if sent_live_on:
+        fetch_btc_price.clear()
+
+    # BTC Price
+    btc = fetch_btc_price()
+    if "error" not in btc:
+        btc_change_color = '#22c55e' if btc['change'] >= 0 else '#f87171'
+        btc_arrow = '▲' if btc['change'] >= 0 else '▼'
+        sent_updated_str = datetime.now().strftime("%H:%M:%S")
+        sent_status_color = '#22c55e' if sent_live_on else '#6B7280'
+        sent_live_badge = (
+            f'<span style="background:{sent_status_color};color:#000;font-size:0.65em;'
+            f'padding:2px 8px;border-radius:10px;font-weight:700;">{"LIVE" if sent_live_on else "DELAYED"}</span>'
+            f'&nbsp;<span style="color:#6B7280;font-size:0.72em;">Updated {sent_updated_str}</span>'
+        )
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:16px;padding:8px 12px;'
+            f'background:#1a1f2e;border-radius:8px;margin-bottom:12px;border:1px solid #2d3748;">'
+            f'<span style="color:#F7931A;font-size:1.1em;font-weight:700;">₿ BTC</span>'
+            f'<span style="color:#e2e8f0;font-size:1.25em;font-weight:700;">${btc["price"]:,.0f}</span>'
+            f'<span style="color:{btc_change_color};font-size:0.9em;font-weight:600;">'
+            f'{btc_arrow} ${abs(btc["change"]):,.0f} ({btc["change_pct"]:+.2f}%)</span>'
+            f'&nbsp;&nbsp;{sent_live_badge}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
     col1, col2 = st.columns(2)
 
     with col1:
@@ -1071,6 +1427,19 @@ with page_tab3:
     if st.button("Refresh Sentiment", key="sentiment_refresh"):
         fetch_cnn_fear_greed.clear()
         fetch_crypto_fear_greed.clear()
+        fetch_btc_price.clear()
         st.rerun()
 
-    st.caption("CNN index refreshes every 30 min. Crypto index via alternative.me.")
+    st.caption("BTC price via Yahoo Finance. CNN/Crypto indices refresh every 30 min.")
+
+    if sent_live_on:
+        sent_countdown = st.empty()
+        for i in range(st.session_state['sent_interval'], 0, -1):
+            sent_countdown.markdown(
+                f'<span style="color:#6B7280;font-size:0.75em;">Next refresh in {i}s</span>',
+                unsafe_allow_html=True
+            )
+            time.sleep(1)
+        sent_countdown.empty()
+        fetch_btc_price.clear()
+        st.rerun()
