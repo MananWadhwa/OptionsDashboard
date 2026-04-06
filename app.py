@@ -171,9 +171,21 @@ def fetch_option_data(occ_list):
             time.sleep(0.5)
         try:
             underlying_ticker = yf.Ticker(ticker_sym)
-            spot_price = _yf_fetch_with_retry(
-                lambda t=underlying_ticker: t.history(period="1d")['Close'].iloc[-1]
+            
+            def fetch_spot_and_vol(t):
+                hist = t.history(period="1y")['Close']
+                if hist.empty:
+                    raise Exception("No price history")
+                spot = float(hist.iloc[-1])
+                returns = np.log(hist / hist.shift(1))
+                vol = float(returns.std() * np.sqrt(252))
+                return spot, vol
+                
+            spot_price, hist_vol = _yf_fetch_with_retry(
+                lambda t=underlying_ticker: fetch_spot_and_vol(t)
             )
+            if pd.isna(hist_vol) or hist_vol < 0.05:
+                hist_vol = 0.25
 
             # Fetch each unique expiration once per ticker
             chains = {}
@@ -201,6 +213,9 @@ def fetch_option_data(occ_list):
 
                     last_price = contract['lastPrice'].values[0]
                     iv         = contract['impliedVolatility'].values[0]
+
+                    if pd.isna(iv) or iv < 0.05:
+                        iv = hist_vol
 
                     days_to_exp = (datetime.strptime(expiration, "%Y-%m-%d") - datetime.now()).days
                     T = max(days_to_exp / 365.0, 0.001)
@@ -338,31 +353,57 @@ with page_tab1:
             )
             singles_df['P&L_%'] = (singles_df['Unrealized_P&L_$'] / (singles_df['Entry_Price'] * 100 * singles_df['Quantity'])).fillna(0) * 100
 
+            singles_df['Position_Delta'] = np.where(
+                singles_df['Side'].str.upper() == 'SHORT',
+                -singles_df['Delta'],
+                singles_df['Delta']
+            )
+            singles_df['Position_Theta'] = np.where(
+                singles_df['Side'].str.upper() == 'SHORT',
+                -singles_df['Theta'],
+                singles_df['Theta']
+            )
             singles_df['Price_Diff_To_Target'] = np.where(
                 singles_df['Side'].str.upper() == 'LONG',
                 singles_df['Target_Price'] - singles_df['Current_Price'],
                 singles_df['Current_Price'] - singles_df['Target_Price']
             )
-            singles_df['Days_To_Target_(Theta)'] = np.where(
-                singles_df['Theta'] != 0,
-                singles_df['Price_Diff_To_Target'] / np.abs(singles_df['Theta']),
-                np.nan
+            safe_theta = np.where(np.abs(singles_df['Position_Theta']) > 1e-4, singles_df['Position_Theta'], np.nan)
+            singles_df['Days_To_Target_(Theta)'] = singles_df['Price_Diff_To_Target'] / safe_theta
+
+            safe_delta = np.where(np.abs(singles_df['Position_Delta']) > 1e-4, singles_df['Position_Delta'], np.nan)
+            
+            intrinsic_target_stock = np.where(
+                singles_df['OptionType'].str.upper() == 'C',
+                singles_df['Strike'] + singles_df['Target_Price'],
+                singles_df['Strike'] - singles_df['Target_Price']
             )
-            singles_df['Underlying_Move_Needed_$'] = np.where(
-                singles_df['Delta'] != 0,
-                singles_df['Price_Diff_To_Target'] / singles_df['Delta'],
-                np.nan
+
+            linear_move = singles_df['Price_Diff_To_Target'] / safe_delta
+            linear_target = singles_df['Underlying_Price'] + linear_move
+
+            is_long_call = (singles_df['Side'].str.upper() == 'LONG') & (singles_df['OptionType'].str.upper() == 'C')
+            is_long_put = (singles_df['Side'].str.upper() == 'LONG') & (singles_df['OptionType'].str.upper() == 'P')
+
+            capped_target = np.where(
+                is_long_call,
+                np.minimum(linear_target, intrinsic_target_stock),
+                np.where(
+                    is_long_put,
+                    np.maximum(linear_target, intrinsic_target_stock),
+                    linear_target
+                )
             )
-            singles_df['Underlying_Move_Needed_$'] = np.where(
-                (singles_df['Side'].str.upper() == 'SHORT') & (singles_df['Delta'] != 0),
-                -singles_df['Underlying_Move_Needed_$'],
-                singles_df['Underlying_Move_Needed_$']
-            )
+
+            final_target = np.where(np.isnan(safe_delta), intrinsic_target_stock, capped_target)
+
+            singles_df['Underlying_Move_Needed_$'] = final_target - singles_df['Underlying_Price']
             singles_df['Target_Hit'] = np.where(
                 singles_df['Side'].str.upper() == 'LONG',
                 singles_df['Current_Price'] >= singles_df['Target_Price'],
                 singles_df['Current_Price'] <= singles_df['Target_Price']
             )
+            singles_df['Underlying_Target'] = final_target
             processed_positions.append(singles_df)
 
         # --- PROCESS SPREADS ---
@@ -393,21 +434,31 @@ with page_tab1:
 
                 pnl = (net_entry_price - net_current_price) * 100 * group['Quantity'].iloc[0]
 
+                current_spread_value = net_current_price if is_credit_spread else -net_current_price
+
                 spread_delta = 0.0
                 spread_theta = 0.0
                 for _, leg in group.iterrows():
                     sign = 1 if leg['Side'].upper() == 'SHORT' else -1
+                    if not is_credit_spread:
+                        sign = -sign
                     spread_delta += sign * leg['Delta']
                     spread_theta += sign * leg['Theta']
 
-                spread_price_change_needed = spread_target - net_current_price
-                days_to_target = spread_price_change_needed / spread_theta if spread_theta != 0 else np.nan
-                underlying_move = spread_price_change_needed / spread_delta if spread_delta != 0 else np.nan
-                target_hit = net_current_price <= spread_target if is_credit_spread else net_current_price >= spread_target
+                spread_price_change_needed = spread_target - current_spread_value
+                days_to_target = spread_price_change_needed / spread_theta if abs(spread_theta) > 1e-4 else np.nan
+                underlying_move = spread_price_change_needed / spread_delta if abs(spread_delta) > 1e-4 else np.nan
+                
+                if is_credit_spread:
+                    target_hit = current_spread_value <= spread_target
+                else:
+                    target_hit = current_spread_value >= spread_target
 
                 aggregated_spreads.append({
                     'Account': group['Account'].iloc[0],
                     'OCC_Symbol': spread_name,
+                    'Underlying_Price': group['Underlying_Price'].iloc[0],
+                    'Underlying_Target': group['Underlying_Price'].iloc[0] + underlying_move if pd.notna(underlying_move) else np.nan,
                     'Side': side,
                     'Quantity': group['Quantity'].iloc[0],
                     'Entry_Price': net_entry_price,
@@ -432,7 +483,7 @@ with page_tab1:
         display_df['OCC_Symbol'] = display_df['OCC_Symbol'].apply(format_occ_for_display).apply(format_occ_html)
 
         display_df = display_df[[
-            'Account', 'OCC_Symbol', 'Side', 'Quantity', 'Entry_Price', 'Current_Price', 'Target_Price',
+            'Account', 'OCC_Symbol', 'Underlying_Price', 'Underlying_Target', 'Side', 'Quantity', 'Entry_Price', 'Current_Price', 'Target_Price',
             'Unrealized_P&L_$', 'P&L_%', 'Days_To_Target_(Theta)', 'Underlying_Move_Needed_$', 'Target_Hit'
         ]].copy()
         display_df = display_df.rename(columns={'OCC_Symbol': 'Option'})
@@ -452,6 +503,8 @@ with page_tab1:
             entry        = row['Entry_Price']
             current      = row['Current_Price']
             target       = row['Target_Price']
+            underlying   = row['Underlying_Price']
+            u_target     = row['Underlying_Target']
             pnl          = row['Unrealized_P&L_$']
             pnl_pct      = row['P&L_%']
             dte          = row['Days_To_Target_(Theta)']
@@ -474,6 +527,8 @@ with page_tab1:
             pnl_pct_str = f"{pnl_pct:+.1f}%" if pd.notna(pnl_pct) and pnl_pct == pnl_pct else ""
             dte_str     = f"{dte:.0f}d"      if pd.notna(dte) and dte == dte else "—"
             move_str    = f"${move:+.2f}"    if pd.notna(move) and move == move else "—"
+            spot_str    = f"${underlying:.2f}" if pd.notna(underlying) else "—"
+            u_target_str = f"${u_target:.2f}" if pd.notna(u_target) else "—"
 
             badge_html   = ('&nbsp;' + badge) if target_hit else ''
 
@@ -491,6 +546,8 @@ with page_tab1:
                 f'<div style="color:#e2e8f0;font-size:0.82em;font-weight:600;">{dte_str}</div></div>'
                 f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Move</div>'
                 f'<div style="color:#60A5FA;font-size:0.82em;font-weight:600;">{move_str}</div></div>'
+                f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Spot Tgt</div>'
+                f'<div style="color:#A78BFA;font-size:0.82em;font-weight:600;">{spot_str} &rarr; {u_target_str}</div></div>'
                 f'</div></div>'
 
                 # RIGHT
@@ -1211,7 +1268,7 @@ def fetch_sentiment_prices(tickers):
     for ticker_id, ticker_info in tickers.items():
         try:
             ticker = yf.Ticker(ticker_id)
-            hist = ticker.history(period="2d")
+            hist = ticker.history(period="5d")
             price = float(hist['Close'].iloc[-1])
             prev  = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else price
             change = price - prev
