@@ -1205,18 +1205,27 @@ with page_tab2:
 # =====================================================================
 
 @st.cache_data(ttl=60)
-def fetch_btc_price():
-    """Fetches current BTC-USD price from Yahoo Finance."""
-    try:
-        btc = yf.Ticker("BTC-USD")
-        hist = btc.history(period="2d")
-        price = float(hist['Close'].iloc[-1])
-        prev  = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else price
-        change = price - prev
-        change_pct = (change / prev * 100) if prev else 0
-        return {"price": price, "change": change, "change_pct": change_pct}
-    except Exception as e:
-        return {"error": str(e)}
+def fetch_sentiment_prices(tickers):
+    """Fetches current prices for a list of tickers from Yahoo Finance."""
+    results = {}
+    for ticker_id, ticker_info in tickers.items():
+        try:
+            ticker = yf.Ticker(ticker_id)
+            hist = ticker.history(period="2d")
+            price = float(hist['Close'].iloc[-1])
+            prev  = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else price
+            change = price - prev
+            change_pct = (change / prev * 100) if prev else 0
+            results[ticker_id] = {
+                "name": ticker_info["name"],
+                "price": price,
+                "change": change,
+                "change_pct": change_pct,
+                "color": ticker_info["color"]
+            }
+        except Exception as e:
+            results[ticker_id] = {"error": str(e), "name": ticker_info["name"]}
+    return results
 
 @st.cache_data(ttl=1800)  # cache 30 min
 def fetch_cnn_fear_greed():
@@ -1357,31 +1366,50 @@ with page_tab3:
         st.session_state['sent_interval'] = sent_interval
 
     if sent_live_on:
-        fetch_btc_price.clear()
+        fetch_sentiment_prices.clear()
 
-    # BTC Price
-    btc = fetch_btc_price()
-    if "error" not in btc:
-        btc_change_color = '#22c55e' if btc['change'] >= 0 else '#f87171'
-        btc_arrow = '▲' if btc['change'] >= 0 else '▼'
-        sent_updated_str = datetime.now().strftime("%H:%M:%S")
-        sent_status_color = '#22c55e' if sent_live_on else '#6B7280'
-        sent_live_badge = (
-            f'<span style="background:{sent_status_color};color:#000;font-size:0.65em;'
-            f'padding:2px 8px;border-radius:10px;font-weight:700;">{"LIVE" if sent_live_on else "DELAYED"}</span>'
-            f'&nbsp;<span style="color:#6B7280;font-size:0.72em;">Updated {sent_updated_str}</span>'
+    # Prices
+    tickers_to_fetch = {
+        "BTC-USD": {"name": "₿ BTC", "color": "#F7931A"},
+        "QQQ": {"name": "QQQ", "color": "#A78BFA"},
+        "SPY": {"name": "SPY", "color": "#A78BFA"},
+        "CL=F": {"name": "NY Crude", "color": "#FB923C"},
+        "BZ=F": {"name": "Brent", "color": "#FB923C"},
+        "ES=F": {"name": "S&P 500 F", "color": "#34D399"},
+        "NQ=F": {"name": "Nasdaq 100 F", "color": "#34D399"},
+    }
+    prices = fetch_sentiment_prices(tickers_to_fetch)
+
+    sent_updated_str = datetime.now().strftime("%H:%M:%S")
+    sent_status_color = '#22c55e' if sent_live_on else '#6B7280'
+    sent_live_badge = (
+        f'<span style="background:{sent_status_color};color:#000;font-size:0.65em;'
+        f'padding:2px 8px;border-radius:10px;font-weight:700;">{"LIVE" if sent_live_on else "DELAYED"}</span>'
+        f'&nbsp;<span style="color:#6B7280;font-size:0.72em;">Updated {sent_updated_str}</span>'
+    )
+
+    prices_html = '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;">'
+    for ticker_id, data in prices.items():
+        if "error" in data:
+            price_html = f'<span style="color:#f87171;font-size:0.9em;">Error</span>'
+        else:
+            change_color = '#22c55e' if data['change'] >= 0 else '#f87171'
+            arrow = '▲' if data['change'] >= 0 else '▼'
+            price_html = (
+                f'<span style="color:#e2e8f0;font-size:1.15em;font-weight:700;">${data["price"]:,.2f}</span>'
+                f'<span style="color:{change_color};font-size:0.85em;font-weight:600;margin-left:8px;">'
+                f'{arrow} {abs(data["change"]):,.2f} ({data["change_pct"]:+.2f}%)</span>'
+            )
+        prices_html += (
+            f'<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;'
+            f'background:#1a1f2e;border-radius:8px;border:1px solid #2d3748;">'
+            f'<span style="color:{data["color"]};font-size:1em;font-weight:700;">{data["name"]}</span>'
+            f'{price_html}'
+            f'</div>'
         )
-        st.markdown(
-            f'<div style="display:flex;align-items:center;gap:16px;padding:8px 12px;'
-            f'background:#1a1f2e;border-radius:8px;margin-bottom:12px;border:1px solid #2d3748;">'
-            f'<span style="color:#F7931A;font-size:1.1em;font-weight:700;">₿ BTC</span>'
-            f'<span style="color:#e2e8f0;font-size:1.25em;font-weight:700;">${btc["price"]:,.0f}</span>'
-            f'<span style="color:{btc_change_color};font-size:0.9em;font-weight:600;">'
-            f'{btc_arrow} ${abs(btc["change"]):,.0f} ({btc["change_pct"]:+.2f}%)</span>'
-            f'&nbsp;&nbsp;{sent_live_badge}'
-            f'</div>',
-            unsafe_allow_html=True
-        )
+    prices_html += f'<div style="margin-left:8px;">{sent_live_badge}</div></div>'
+    st.markdown(prices_html, unsafe_allow_html=True)
+
 
     col1, col2 = st.columns(2)
 
@@ -1427,10 +1455,10 @@ with page_tab3:
     if st.button("Refresh Sentiment", key="sentiment_refresh"):
         fetch_cnn_fear_greed.clear()
         fetch_crypto_fear_greed.clear()
-        fetch_btc_price.clear()
+        fetch_sentiment_prices.clear()
         st.rerun()
 
-    st.caption("BTC price via Yahoo Finance. CNN/Crypto indices refresh every 30 min.")
+    st.caption("Prices via Yahoo Finance. CNN/Crypto indices refresh every 30 min.")
 
     if sent_live_on:
         sent_countdown = st.empty()
@@ -1441,5 +1469,5 @@ with page_tab3:
             )
             time.sleep(1)
         sent_countdown.empty()
-        fetch_btc_price.clear()
+        fetch_sentiment_prices.clear()
         st.rerun()
