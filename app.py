@@ -96,6 +96,21 @@ def calculate_greeks(S, K, T, r, sigma, option_type):
 
     return delta, theta, gamma
 
+def calculate_bs_price(S, K, T, r, sigma, option_type):
+    """Calculates Option Price using Black-Scholes."""
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return 0.0
+
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+
+    if option_type == 'C':
+        price = S * si.norm.cdf(d1) - K * np.exp(-r * T) * si.norm.cdf(d2)
+    else:
+        price = K * np.exp(-r * T) * si.norm.cdf(-d2) - S * si.norm.cdf(-d1)
+    
+    return price
+
 # --- OCC SYMBOL PARSER ---
 def parse_occ(symbol):
     """Parses standard OCC option symbol into components."""
@@ -137,6 +152,16 @@ def format_occ_html(plain_option):
     )
 
 # --- DATA FETCHING ---
+def get_latest_price(ticker_obj):
+    """Fetches the most up-to-date spot price and timestamp, including pre/post market."""
+    hist = ticker_obj.history(period="5d", interval="1m", prepost=True)
+    if not hist.empty:
+        return float(hist['Close'].iloc[-1]), hist.index[-1]
+    hist = ticker_obj.history(period="1d", prepost=True)
+    if not hist.empty:
+        return float(hist['Close'].iloc[-1]), hist.index[-1]
+    return 0.0, pd.Timestamp.now(tz="UTC")
+
 def _yf_fetch_with_retry(fn, retries=3, base_delay=5):
     """Calls fn(), retrying on rate-limit errors with exponential backoff."""
     for attempt in range(retries):
@@ -173,15 +198,15 @@ def fetch_option_data(occ_list):
             underlying_ticker = yf.Ticker(ticker_sym)
             
             def fetch_spot_and_vol(t):
-                hist = t.history(period="1y")['Close']
+                hist = t.history(period="1y", prepost=True)['Close']
                 if hist.empty:
                     raise Exception("No price history")
-                spot = float(hist.iloc[-1])
+                spot, stock_date = get_latest_price(t)
                 returns = np.log(hist / hist.shift(1))
                 vol = float(returns.std() * np.sqrt(252))
-                return spot, vol
+                return spot, vol, stock_date
                 
-            spot_price, hist_vol = _yf_fetch_with_retry(
+            spot_price, hist_vol, stock_date = _yf_fetch_with_retry(
                 lambda t=underlying_ticker: fetch_spot_and_vol(t)
             )
             if pd.isna(hist_vol) or hist_vol < 0.05:
@@ -221,6 +246,20 @@ def fetch_option_data(occ_list):
                     T = max(days_to_exp / 365.0, 0.001)
 
                     delta, theta, _ = calculate_greeks(spot_price, strike, T, r, iv, opt_type)
+
+                    # Use approximation if option data timestamp is different from stock price timestamp
+                    if 'lastTradeDate' in contract.columns:
+                        trade_time = pd.to_datetime(contract['lastTradeDate'].values[0])
+                        if trade_time.tzinfo is None:
+                            trade_time = trade_time.tz_localize('UTC')
+                        stock_time = stock_date
+                        if stock_time.tzinfo is None:
+                            stock_time = stock_time.tz_localize('UTC')
+                        
+                        if trade_time < stock_time and iv > 0:
+                            approx_price = calculate_bs_price(spot_price, strike, T, r, iv, opt_type)
+                            if approx_price > 0:
+                                last_price = approx_price
 
                     results.append({
                         "OCC_Symbol":       occ,
@@ -745,7 +784,7 @@ def fetch_watchlist_prices(occ_list):
         ticker, expiration, opt_type, strike = parsed
         try:
             underlying_ticker = yf.Ticker(ticker)
-            spot = float(underlying_ticker.history(period="1d")['Close'].iloc[-1])
+            spot, stock_date = get_latest_price(underlying_ticker)
             chain = underlying_ticker.option_chain(expiration)
             options = chain.calls if opt_type == 'C' else chain.puts
             contract = options[options['strike'] == strike]
@@ -757,6 +796,21 @@ def fetch_watchlist_prices(occ_list):
             days_to_exp = (datetime.strptime(expiration, "%Y-%m-%d") - datetime.now()).days
             T = max(days_to_exp / 365.0, 0.001)
             delta, _, gamma = calculate_greeks(spot, strike, T, r_free, iv, opt_type)
+            
+            # Use approximation if option data timestamp is different from stock price timestamp
+            if 'lastTradeDate' in contract.columns:
+                trade_time = pd.to_datetime(contract['lastTradeDate'].values[0])
+                if trade_time.tzinfo is None:
+                    trade_time = trade_time.tz_localize('UTC')
+                stock_time = stock_date
+                if stock_time.tzinfo is None:
+                    stock_time = stock_time.tz_localize('UTC')
+                
+                if trade_time < stock_time and iv > 0:
+                    approx_price = calculate_bs_price(spot, strike, T, r_free, iv, opt_type)
+                    if approx_price > 0:
+                        option_price = approx_price
+            
             results[occ] = {'option_price': option_price, 'spot': spot, 'delta': delta, 'gamma': gamma}
         except Exception:
             results[occ] = {'option_price': None, 'spot': None, 'delta': None, 'gamma': None}
@@ -874,15 +928,15 @@ def fetch_stock_prices(tickers):
     for ticker in tickers:
         try:
             t = yf.Ticker(ticker)
-            hist = t.history(period="1y")
+            hist = t.history(period="1y", prepost=True)
             if hist.empty:
                 raise ValueError("No data returned")
 
             close = hist['Close']
 
             # Price & day change
-            price  = float(close.iloc[-1])
-            prev   = float(close.iloc[-2]) if len(close) >= 2 else price
+            price, _  = get_latest_price(t)
+            prev   = float(close.iloc[-2]) if len(close) >= 2 else float(close.iloc[-1])
             change     = price - prev
             change_pct = (change / prev * 100) if prev else 0
 
@@ -1268,9 +1322,9 @@ def fetch_sentiment_prices(tickers):
     for ticker_id, ticker_info in tickers.items():
         try:
             ticker = yf.Ticker(ticker_id)
-            hist = ticker.history(period="5d")
-            price = float(hist['Close'].iloc[-1])
-            prev  = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else price
+            hist = ticker.history(period="5d", prepost=True)
+            price, _ = get_latest_price(ticker)
+            prev  = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else float(hist['Close'].iloc[-1])
             change = price - prev
             change_pct = (change / prev * 100) if prev else 0
             results[ticker_id] = {
