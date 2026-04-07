@@ -3,8 +3,9 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import scipy.stats as si
+from scipy.optimize import brentq
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import glob
 import os
 import urllib.request
@@ -96,20 +97,98 @@ def calculate_greeks(S, K, T, r, sigma, option_type):
 
     return delta, theta, gamma
 
-def calculate_bs_price(S, K, T, r, sigma, option_type):
-    """Calculates Option Price using Black-Scholes."""
+def binomial_tree_american(S, K, T, r, q, sigma, option_type, N=200):
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
-
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-
-    if option_type == 'C':
-        price = S * si.norm.cdf(d1) - K * np.exp(-r * T) * si.norm.cdf(d2)
-    else:
-        price = K * np.exp(-r * T) * si.norm.cdf(-d2) - S * si.norm.cdf(-d1)
+    dt = T / N
+    u = np.exp(sigma * np.sqrt(dt))
+    d = 1 / u
+    p = (np.exp((r - q) * dt) - d) / (u - d) 
     
-    return price
+    option_values = np.zeros(N + 1)
+    for i in range(N + 1):
+        stock_price = S * (u ** (N - i)) * (d ** i)
+        if option_type == 'C':
+            option_values[i] = max(0, stock_price - K)
+        else:
+            option_values[i] = max(0, K - stock_price)
+            
+    for j in range(N - 1, -1, -1):
+        for i in range(j + 1):
+            hold_value = np.exp(-r * dt) * (p * option_values[i] + (1 - p) * option_values[i + 1])
+            current_stock_price = S * (u ** (j - i)) * (d ** i)
+            if option_type == 'C':
+                exercise_value = max(0, current_stock_price - K)
+            else:
+                exercise_value = max(0, K - current_stock_price)
+            option_values[i] = max(hold_value, exercise_value)
+    return option_values[0]
+
+def black_scholes(S, K, T, r, q, sigma, option_type):
+    from scipy.stats import norm
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return max(0, S - K) if option_type == 'C' else max(0, K - S)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if option_type == 'C':
+        return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    else:
+        return K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+
+def implied_volatility(target_price, S, K, T, r, q, option_type):
+    # Use Black-Scholes for IV solving — always monotone in sigma, no spurious roots
+    def objective_function(sigma):
+        return black_scholes(S, K, T, r, q, sigma, option_type) - target_price
+    try:
+        iv = brentq(objective_function, 0.01, 5.0)
+        return iv
+    except ValueError:
+        return None
+
+# Simple cache for 1m history to avoid redundant API calls per ticker
+_hist_1m_cache = {}
+
+def approximate_realtime_option_price(ticker_obj, ticker_sym, actual_stock_price, strike, last_price, trade_time, exp_date_str, opt_type):
+    try:
+        if ticker_sym not in _hist_1m_cache:
+            hist = ticker_obj.history(period="5d", interval="1m")
+            if not hist.empty:
+                hist.index = hist.index.tz_convert('UTC')
+            _hist_1m_cache[ticker_sym] = hist
+
+        hist = _hist_1m_cache[ticker_sym]
+
+        if hist.empty:
+            stock_price_at_trade = actual_stock_price
+        else:
+            past_hist = hist[hist.index <= trade_time]
+            if not past_hist.empty:
+                stock_price_at_trade = past_hist.iloc[-1]['Close']
+            else:
+                stock_price_at_trade = actual_stock_price
+
+        actual_stock_timestamp = datetime.now(timezone.utc)
+
+        exp_date = datetime.strptime(exp_date_str, "%Y-%m-%d").replace(hour=16, minute=0, second=0, tzinfo=timezone.utc)
+
+        T_trade = max(0.001, (exp_date - trade_time).total_seconds() / (365.0 * 24 * 3600))
+        T_current = max(0.001, (exp_date - actual_stock_timestamp).total_seconds() / (365.0 * 24 * 3600))
+
+        r = 0.045
+        try:
+            div_yield = ticker_obj.info.get('dividendYield', 0.0) or 0.0
+            q = div_yield / 100  # yfinance returns dividendYield as a percentage (e.g. 0.98 for 0.98%)
+        except:
+            q = 0.0
+
+        # Solve IV from last traded price using B-S (always monotone — no spurious roots)
+        true_iv = implied_volatility(last_price, stock_price_at_trade, strike, T_trade, r, q, opt_type)
+        if true_iv is None:
+            return 0.0
+
+        return binomial_tree_american(actual_stock_price, strike, T_current, r, q, true_iv, opt_type, N=200)
+    except Exception as e:
+        return 0.0
 
 # --- OCC SYMBOL PARSER ---
 def parse_occ(symbol):
@@ -257,7 +336,7 @@ def fetch_option_data(occ_list):
                             stock_time = stock_time.tz_localize('UTC')
                         
                         if trade_time < stock_time and iv > 0:
-                            approx_price = calculate_bs_price(spot_price, strike, T, r, iv, opt_type)
+                            approx_price = approximate_realtime_option_price(underlying_ticker, ticker_sym, spot_price, strike, last_price, trade_time, expiration, opt_type)
                             if approx_price > 0:
                                 last_price = approx_price
 
@@ -807,7 +886,7 @@ def fetch_watchlist_prices(occ_list):
                     stock_time = stock_time.tz_localize('UTC')
                 
                 if trade_time < stock_time and iv > 0:
-                    approx_price = calculate_bs_price(spot, strike, T, r_free, iv, opt_type)
+                    approx_price = approximate_realtime_option_price(underlying_ticker, ticker, spot, strike, option_price, trade_time, expiration, opt_type)
                     if approx_price > 0:
                         option_price = approx_price
             
