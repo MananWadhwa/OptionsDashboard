@@ -184,11 +184,11 @@ def approximate_realtime_option_price(ticker_obj, ticker_sym, actual_stock_price
         # Solve IV from last traded price using B-S (always monotone — no spurious roots)
         true_iv = implied_volatility(last_price, stock_price_at_trade, strike, T_trade, r, q, opt_type)
         if true_iv is None:
-            return 0.0
+            return 0.0, stock_price_at_trade
 
-        return binomial_tree_american(actual_stock_price, strike, T_current, r, q, true_iv, opt_type, N=200)
+        return binomial_tree_american(actual_stock_price, strike, T_current, r, q, true_iv, opt_type, N=200), stock_price_at_trade
     except Exception as e:
-        return 0.0
+        return 0.0, None
 
 # --- OCC SYMBOL PARSER ---
 def parse_occ(symbol):
@@ -315,7 +315,8 @@ def fetch_option_data(occ_list):
                         st.warning(f"Could not find contract for {occ}. Strike {strike} may not be available (spot: {spot_price:.2f}).")
                         continue
 
-                    last_price = contract['lastPrice'].values[0]
+                    fetched_option_price = contract['lastPrice'].values[0]
+                    last_price = fetched_option_price
                     iv         = contract['impliedVolatility'].values[0]
 
                     if pd.isna(iv) or iv < 0.05:
@@ -327,26 +328,37 @@ def fetch_option_data(occ_list):
                     delta, theta, _ = calculate_greeks(spot_price, strike, T, r, iv, opt_type)
 
                     # Use approximation if option data timestamp is different from stock price timestamp
+                    option_trade_time    = None
+                    stock_quote_time     = stock_date
+                    estimated_price      = None
+                    stock_at_option_time = None
                     if 'lastTradeDate' in contract.columns:
                         trade_time = pd.to_datetime(contract['lastTradeDate'].values[0])
                         if trade_time.tzinfo is None:
                             trade_time = trade_time.tz_localize('UTC')
+                        option_trade_time = trade_time
                         stock_time = stock_date
                         if stock_time.tzinfo is None:
                             stock_time = stock_time.tz_localize('UTC')
-                        
+
                         if trade_time < stock_time and iv > 0:
-                            approx_price = approximate_realtime_option_price(underlying_ticker, ticker_sym, spot_price, strike, last_price, trade_time, expiration, opt_type)
+                            approx_price, stock_at_option_time = approximate_realtime_option_price(underlying_ticker, ticker_sym, spot_price, strike, last_price, trade_time, expiration, opt_type)
                             if approx_price > 0:
+                                estimated_price = approx_price
                                 last_price = approx_price
 
                     results.append({
-                        "OCC_Symbol":       occ,
-                        "Underlying_Price": spot_price,
-                        "Current_Price":    last_price,
-                        "Delta":            delta,
-                        "Theta":            theta,
-                        "DTE":              days_to_exp
+                        "OCC_Symbol":            occ,
+                        "Underlying_Price":       spot_price,
+                        "Stock_Price_Timestamp":  stock_quote_time,
+                        "Current_Price":          last_price,
+                        "Option_Fetched_Price":   fetched_option_price,
+                        "Option_Trade_Timestamp": option_trade_time,
+                        "Stock_At_Option_Time":   stock_at_option_time,
+                        "Estimated_Price":        estimated_price,
+                        "Delta":                  delta,
+                        "Theta":                  theta,
+                        "DTE":                    days_to_exp
                     })
                 except Exception as e:
                     st.warning(f"Could not process {occ}: {e}")
@@ -378,13 +390,228 @@ def save_account_to_file(all_positions_df, account):
     out['Spread_Target'] = out['Spread_Target'].fillna('')
     out.to_csv(filepath, index=False)
 
+@st.cache_data(ttl=3600)
+def parse_portfolio_pdfs():
+    """Parse Robinhood portfolio statement PDFs from positions/portfolio/."""
+    import pdfplumber
+    import re as _re
+
+    accounts = {}
+    pdf_files = sorted(glob.glob("positions/portfolio/*.pdf"))
+    if not pdf_files:
+        return accounts
+
+    acct_patterns = [
+        (_re.compile(r'Individual Account #:'), 'RH', 'Individual'),
+        (_re.compile(r'Traditional IRA Account #:'), 'RH-IRA', 'Traditional IRA'),
+        (_re.compile(r'Roth IRA Account #:'), 'RH-Roth', 'Roth IRA'),
+    ]
+
+    for pdf_path in pdf_files:
+        with pdfplumber.open(pdf_path) as pdf:
+            current_key = None
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+
+                # Detect account boundary
+                for pat, key, acct_type in acct_patterns:
+                    if pat.search(text):
+                        if key not in accounts:
+                            accounts[key] = {
+                                'name': key, 'type': acct_type,
+                                'portfolio_value': None, 'cash_balance': None,
+                                'total_securities': None, 'dividends_period': None,
+                                'period': None, 'holdings': [],
+                                'cost_basis_map': {},
+                            }
+                        current_key = key
+                        break
+
+                if not current_key:
+                    continue
+                acct = accounts[current_key]
+
+                # Period
+                if acct['period'] is None:
+                    m = _re.search(r'(\d{2}/\d{2}/\d{4}) to (\d{2}/\d{2}/\d{4})', text)
+                    if m:
+                        acct['period'] = f"{m.group(1)} \u2013 {m.group(2)}"
+
+                # Portfolio Value (closing)
+                if acct['portfolio_value'] is None:
+                    m = _re.search(r'Portfolio Value\s+\$[\d,]+\.\d+\s+\$([\d,]+\.\d+)', text)
+                    if m:
+                        acct['portfolio_value'] = float(m.group(1).replace(',', ''))
+
+                # Cash balance (closing) — IRA uses "Net Account Balance", individual uses "Brokerage Cash Balance"
+                if acct['cash_balance'] is None:
+                    m = _re.search(r'Brokerage Cash Balance\s*\*?\s+\(?\$?([\d,]+\.\d+)\)?\s+(\(?\$?[\d,]+\.\d+\)?)', text)
+                    if m:
+                        raw = m.group(2).replace('$', '').replace(',', '').replace('(', '-').replace(')', '')
+                        acct['cash_balance'] = float(raw)
+                    else:
+                        m = _re.search(r'Net Account Balance\s+\$[\d,]+\.\d+\s+\$([\d,]+\.\d+)', text)
+                        if m:
+                            acct['cash_balance'] = float(m.group(1).replace(',', ''))
+
+                # Total Securities (closing)
+                if acct['total_securities'] is None:
+                    m = _re.search(r'Total Securities\s*[†\*]?\s+\$[\d,]+\.\d+\s+\$([\d,]+\.\d+)', text)
+                    if m:
+                        acct['total_securities'] = float(m.group(1).replace(',', ''))
+
+                # Dividends (This Period)
+                if acct['dividends_period'] is None:
+                    m = _re.search(r'Dividends\s+\$([\d,]+\.\d+)', text)
+                    if m:
+                        acct['dividends_period'] = float(m.group(1).replace(',', ''))
+
+                # Holdings from Portfolio Summary pages — text-based (PDFs have no tables)
+                if 'Portfolio Summary' in text and 'Securities Held in Account' in text:
+                    lines = [l.strip() for l in text.split('\n')]
+                    has_est_yield = 'Estimated Yield:' in text  # Format 2 indicator
+
+                    _skip_pfx = ('Page ', 'Portfolio Summary', 'Securities Held in Account',
+                                 'Loaned Securities', 'Total Securities', 'Brokerage Cash',
+                                 'Total Priced', 'Deposit Sweep', 'Estimated Yield',
+                                 '† ', '* ', '** ')
+
+                    def _parse_mkt(raw):
+                        return float(raw.replace('$', '').replace(',', '').replace('(', '-').replace(')', ''))
+
+                    if has_est_yield:
+                        # Format 2: Name line → "SYMBOL Margin QtyS? $Price ($MktValue) $EstDiv Pct%"
+                        _dpat = _re.compile(
+                            r'^([A-Z\.]{1,6})\s+(?:Margin|Cash)\s+([\d,]+\.?\d*)(S?)'
+                            r'\s+\$([\d,]+\.\d+)\s+(\(?\$?[\d,]+\.\d+\)?)'
+                            r'\s+\$[\d,]+\.\d+\s+([\d.]+)%'
+                        )
+                        for idx, line in enumerate(lines):
+                            m = _dpat.match(line)
+                            if not m:
+                                continue
+                            sym, qty_str, short_flag, price_str, mkt_raw, pct_str = m.groups()
+                            name = ''
+                            for j in range(idx - 1, max(idx - 6, -1), -1):
+                                prev = lines[j]
+                                if not prev or any(prev.startswith(p) for p in _skip_pfx):
+                                    continue
+                                if _dpat.match(prev):
+                                    continue
+                                name = prev
+                                break
+                            try:
+                                is_short = bool(short_flag)
+                                qty = float(qty_str.replace(',', ''))
+                                if is_short:
+                                    qty = -qty
+                                price = float(price_str.replace(',', ''))
+                                mkt_value = _parse_mkt(mkt_raw)
+                                pct = float(pct_str)
+                                is_option = bool(_re.search(r'\d{2}/\d{2}/\d{4}', name))
+                                if sym and qty != 0:
+                                    acct['holdings'].append({
+                                        'name': name,
+                                        'symbol': sym,
+                                        'qty': qty,
+                                        'price': abs(price),
+                                        'mkt_value': mkt_value,
+                                        'pct_portfolio': abs(pct),
+                                        'is_option': is_option,
+                                        'is_short': is_short,
+                                        'cost_basis': None,
+                                    })
+                            except (ValueError, IndexError):
+                                continue
+                    else:
+                        # Format 1: all on one line — "Name SYMBOL Margin Qty $Price $MktValue Pct%"
+                        _dpat1 = _re.compile(
+                            r'^(.+)\s+([A-Z\.]{1,6})\s+(?:Margin|Cash)\s+([\d,]+\.?\d*)(S?)'
+                            r'\s+\$([\d,]+\.\d+)\s+(\(?\$?[\d,]+\.\d+\)?)\s+([\d.]+)%'
+                        )
+                        for line in lines:
+                            m = _dpat1.match(line)
+                            if not m:
+                                continue
+                            name, sym, qty_str, short_flag, price_str, mkt_raw, pct_str = m.groups()
+                            try:
+                                is_short = bool(short_flag)
+                                qty = float(qty_str.replace(',', ''))
+                                if is_short:
+                                    qty = -qty
+                                price = float(price_str.replace(',', ''))
+                                mkt_value = _parse_mkt(mkt_raw)
+                                pct = float(pct_str)
+                                is_option = bool(_re.search(r'\d{2}/\d{2}/\d{4}', name))
+                                if sym and qty != 0:
+                                    acct['holdings'].append({
+                                        'name': name.strip(),
+                                        'symbol': sym,
+                                        'qty': qty,
+                                        'price': abs(price),
+                                        'mkt_value': mkt_value,
+                                        'pct_portfolio': abs(pct),
+                                        'is_option': is_option,
+                                        'is_short': is_short,
+                                        'cost_basis': None,
+                                    })
+                            except (ValueError, IndexError):
+                                continue
+
+                # Cost basis from Gain/Loss section
+                if current_key and ('Cost Basis' in text or 'Unrealized' in text):
+                    acct = accounts[current_key]
+                    for table in (page.extract_tables() or []):
+                        if not table:
+                            continue
+                        cost_col = sym_col = header_idx = None
+                        for i, row in enumerate(table):
+                            if not row:
+                                continue
+                            row_strs = [str(c or '').strip() for c in row]
+                            if any('Cost Basis' in c for c in row_strs):
+                                header_idx = i
+                                for j, cell in enumerate(row_strs):
+                                    if 'Cost Basis' in cell:
+                                        cost_col = j
+                                    if cell in ('Symbol', 'Sym', 'Sym/Cusip', 'Sym/ Cusip'):
+                                        sym_col = j
+                                break
+                        if cost_col is None:
+                            continue
+                        if sym_col is None:
+                            sym_col = 1
+                        data_rows = table[header_idx + 1:] if header_idx is not None else table
+                        for row in data_rows:
+                            if not row:
+                                continue
+                            try:
+                                sym = str(row[sym_col] or '').strip() if sym_col < len(row) else ''
+                                cost_raw = str(row[cost_col] or '').strip() if cost_col < len(row) else ''
+                                if not sym or not cost_raw or sym in ('', 'None', 'Symbol', 'Sym/Cusip'):
+                                    continue
+                                cost_clean = cost_raw.replace('$', '').replace(',', '').replace('(', '-').replace(')', '')
+                                acct['cost_basis_map'][sym] = float(cost_clean)
+                            except (ValueError, IndexError):
+                                continue
+
+    # Match cost_basis_map entries to holdings
+    for acct in accounts.values():
+        cb_map = acct.get('cost_basis_map', {})
+        if cb_map:
+            for holding in acct['holdings']:
+                if holding['cost_basis'] is None and holding['symbol'] in cb_map:
+                    holding['cost_basis'] = cb_map[holding['symbol']]
+
+    return accounts
+
 # --- MAIN DASHBOARD ---
 st.markdown(
     '<div style="font-size:1.1em;font-weight:700;color:#e2e8f0;'
     'padding:4px 0 10px;letter-spacing:0.01em;">Options Tracker</div>',
     unsafe_allow_html=True
 )
-page_tab1, page_tab2, page_tab3 = st.tabs(["Portfolio", "Watchlist", "Sentiment"])
+page_tab1, page_tab2, page_tab3, page_tab4 = st.tabs(["Portfolio", "Watchlist", "Sentiment", "Summary"])
 
 with page_tab1:
     # Load Positions from multiple files
@@ -711,6 +938,52 @@ with page_tab1:
         st.markdown(pf_live_badge, unsafe_allow_html=True)
         st.caption("Greeks are Black-Scholes approximations.")
 
+        with st.expander("Price Details", expanded=False):
+            if not market_data.empty:
+                detail_cols = ['OCC_Symbol', 'Option_Fetched_Price', 'Option_Trade_Timestamp',
+                               'Stock_At_Option_Time', 'Underlying_Price', 'Stock_Price_Timestamp',
+                               'Estimated_Price', 'Current_Price']
+                available = [c for c in detail_cols if c in market_data.columns]
+                detail_df = market_data[available].copy()
+
+                def _fmt_ts(ts):
+                    if ts is None or (isinstance(ts, float) and np.isnan(ts)):
+                        return "—"
+                    try:
+                        ts = pd.Timestamp(ts)
+                        if ts.tzinfo is not None:
+                            ts = ts.tz_convert('US/Eastern')
+                        return ts.strftime("%Y-%m-%d %H:%M ET")
+                    except Exception:
+                        return str(ts)
+
+                if 'Option_Trade_Timestamp' in detail_df.columns:
+                    detail_df['Option_Trade_Timestamp'] = detail_df['Option_Trade_Timestamp'].apply(_fmt_ts)
+                if 'Stock_Price_Timestamp' in detail_df.columns:
+                    detail_df['Stock_Price_Timestamp'] = detail_df['Stock_Price_Timestamp'].apply(_fmt_ts)
+                if 'Estimated_Price' in detail_df.columns:
+                    detail_df['Estimated_Price'] = detail_df['Estimated_Price'].apply(
+                        lambda x: f"${x:.2f}" if pd.notna(x) and x is not None else "—"
+                    )
+
+                detail_df['OCC_Symbol'] = detail_df['OCC_Symbol'].apply(format_occ_for_display)
+                detail_df = detail_df.rename(columns={
+                    'OCC_Symbol':             'Option',
+                    'Option_Fetched_Price':   'Fetched Price',
+                    'Option_Trade_Timestamp': 'Option Timestamp',
+                    'Stock_At_Option_Time':   'Stock @ Option Time',
+                    'Underlying_Price':       'Stock Price (now)',
+                    'Stock_Price_Timestamp':  'Stock Timestamp',
+                    'Estimated_Price':        'Est. Price',
+                    'Current_Price':          'Used Price',
+                })
+                for col in ['Fetched Price', 'Stock @ Option Time', 'Stock Price (now)', 'Used Price']:
+                    if col in detail_df.columns:
+                        detail_df[col] = detail_df[col].apply(
+                            lambda x: f"${x:.2f}" if pd.notna(x) else "—"
+                        )
+                st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
         if st.button("Refresh Market Data"):
             fetch_option_data.clear()
             st.rerun()
@@ -886,7 +1159,7 @@ def fetch_watchlist_prices(occ_list):
                     stock_time = stock_time.tz_localize('UTC')
                 
                 if trade_time < stock_time and iv > 0:
-                    approx_price = approximate_realtime_option_price(underlying_ticker, ticker, spot, strike, option_price, trade_time, expiration, opt_type)
+                    approx_price, _ = approximate_realtime_option_price(underlying_ticker, ticker, spot, strike, option_price, trade_time, expiration, opt_type)
                     if approx_price > 0:
                         option_price = approx_price
             
@@ -1171,6 +1444,248 @@ def stock_card_html(row, data):
   </div>
   {indicators_html}
 </div>"""
+
+def _pdf_option_to_occ(name):
+    """Convert PDF option name like 'ORCL 04/17/2026 Put $155.00' to OCC symbol string."""
+    m = re.search(r'(\w+)\s+(\d{2})/(\d{2})/(\d{4})\s+(Call|Put)\s+\$(\d+(?:\.\d+)?)', name)
+    if not m:
+        return None
+    ticker, mm, dd, yyyy, cp, strike_str = m.groups()
+    yy = yyyy[2:]
+    cp_char = 'C' if cp == 'Call' else 'P'
+    strike_int = int(float(strike_str) * 1000)
+    return f"{ticker}{yy}{mm}{dd}{cp_char}{strike_int:08d}"
+
+def _format_pdf_symbol(name, symbol, is_option):
+    """Format display symbol: equity → ticker, option → 'ORCL P 041726 $155'."""
+    if not is_option:
+        return symbol
+    m = re.search(r'(\w+)\s+(\d{2})/(\d{2})/(\d{4})\s+(Call|Put)\s+\$(\d+(?:\.\d+)?)', name)
+    if not m:
+        return f"{symbol} (opt)"
+    ticker, mm, dd, yyyy, cp, strike_str = m.groups()
+    yy = yyyy[2:]
+    cp_char = 'C' if cp == 'Call' else 'P'
+    strike = float(strike_str)
+    strike_fmt = int(strike) if strike == int(strike) else strike
+    return f"{ticker} {cp_char} {mm}{dd}{yy} ${strike_fmt}"
+
+@st.cache_data(ttl=300)
+def fetch_summary_equity_prices(tickers_tuple):
+    """Lightweight batch equity price fetch for the Summary tab (5-min cache)."""
+    result = {}
+    for ticker in tickers_tuple:
+        try:
+            t = yf.Ticker(ticker)
+            price, _ = get_latest_price(t)
+            result[ticker] = price
+        except Exception:
+            result[ticker] = None
+    return result
+
+with page_tab4:
+    st.markdown('<div style="font-size:1em;font-weight:700;color:#e2e8f0;padding:2px 0 10px;">Portfolio Summary</div>', unsafe_allow_html=True)
+
+    try:
+        pdf_accounts = parse_portfolio_pdfs()
+    except Exception as _e:
+        st.error(f"Error parsing portfolio PDFs: {_e}")
+        pdf_accounts = {}
+
+    if not pdf_accounts:
+        st.warning("No portfolio PDFs found in positions/portfolio/. Drop Robinhood statement PDFs there and refresh.")
+    else:
+        acct_keys = sorted(pdf_accounts.keys())
+        sum_sel = st.multiselect(
+            "Filter by Account",
+            options=["All"] + acct_keys,
+            default=["All"],
+            key="sum_acct_filter"
+        )
+        selected_accts = acct_keys if ("All" in sum_sel or not sum_sel) else [k for k in sum_sel if k in pdf_accounts]
+
+        # --- TOP METRICS (aggregated across selected accounts) ---
+        total_pv  = sum(pdf_accounts[k]['portfolio_value']   or 0 for k in selected_accts)
+        total_sec = sum(pdf_accounts[k]['total_securities']  or 0 for k in selected_accts)
+        total_div = sum(pdf_accounts[k]['dividends_period']  or 0 for k in selected_accts)
+        period_str = pdf_accounts[selected_accts[0]]['period'] or "" if selected_accts else ""
+
+        st.markdown(f"""
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px;">
+  <div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:14px 20px;flex:2;min-width:180px;">
+    <div style="color:#9CA3AF;font-size:0.65em;text-transform:uppercase;margin-bottom:4px;">Total Portfolio Value</div>
+    <div style="font-size:1.5em;font-weight:700;color:#e2e8f0;">${total_pv:,.2f}</div>
+    <div style="color:#6B7280;font-size:0.7em;margin-top:3px;">{period_str}</div>
+  </div>
+  <div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:14px 20px;flex:1;min-width:140px;">
+    <div style="color:#9CA3AF;font-size:0.65em;text-transform:uppercase;margin-bottom:4px;">Total Securities</div>
+    <div style="font-size:1.5em;font-weight:700;color:#e2e8f0;">${total_sec:,.2f}</div>
+  </div>
+  <div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:14px 20px;flex:1;min-width:140px;">
+    <div style="color:#9CA3AF;font-size:0.65em;text-transform:uppercase;margin-bottom:4px;">Dividends (Period)</div>
+    <div style="font-size:1.5em;font-weight:700;color:#22c55e;">${total_div:,.2f}</div>
+  </div>
+  <div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:14px 20px;flex:1;min-width:100px;">
+    <div style="color:#9CA3AF;font-size:0.65em;text-transform:uppercase;margin-bottom:4px;">Accounts</div>
+    <div style="font-size:1.5em;font-weight:700;color:#e2e8f0;">{len(selected_accts)}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+        # --- PER-ACCOUNT SUMMARY CARDS ---
+        cards_row = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">'
+        for key in selected_accts:
+            acct = pdf_accounts[key]
+            pv   = acct['portfolio_value']  or 0
+            cash = acct['cash_balance']     or 0
+            sec  = acct['total_securities'] or 0
+            div  = acct['dividends_period'] or 0
+            cash_color = '#22c55e' if cash >= 0 else '#f87171'
+            cards_row += f"""
+<div style="border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:12px 16px;flex:1;min-width:200px;background:rgba(255,255,255,0.02);">
+  <div style="font-size:0.85em;font-weight:700;color:#e2e8f0;">{key}</div>
+  <div style="color:#6B7280;font-size:0.65em;margin-bottom:8px;">{acct['type']} &bull; {acct.get('period','')}</div>
+  <div style="font-size:1.2em;font-weight:700;color:#e2e8f0;margin-bottom:6px;">${pv:,.2f}</div>
+  <div style="display:flex;gap:16px;flex-wrap:wrap;">
+    <div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Securities</div><div style="color:#e2e8f0;font-size:0.85em;font-weight:600;">${sec:,.2f}</div></div>
+    <div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Cash</div><div style="color:{cash_color};font-size:0.85em;font-weight:600;">${cash:,.2f}</div></div>
+    <div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Dividends</div><div style="color:#22c55e;font-size:0.85em;font-weight:600;">${div:,.2f}</div></div>
+  </div>
+</div>"""
+        cards_row += '</div>'
+        st.markdown(cards_row, unsafe_allow_html=True)
+
+        # --- AGGREGATE HOLDINGS ACROSS SELECTED ACCOUNTS ---
+        from collections import defaultdict
+        aggregated = defaultdict(lambda: {
+            'display_symbol': '', 'is_option': False, 'is_short': False,
+            'sum_qty': 0.0, 'sum_cost_basis': 0.0, 'has_cost_basis': False,
+            'occ': None, 'ticker': None,
+        })
+        for key in selected_accts:
+            for h in pdf_accounts[key]['holdings']:
+                disp = _format_pdf_symbol(h['name'], h['symbol'], h['is_option'])
+                row = aggregated[disp]
+                row['display_symbol'] = disp
+                row['is_option'] = h['is_option']
+                row['is_short'] = h['is_short']
+                row['sum_qty'] += h['qty']
+                if h.get('cost_basis') is not None:
+                    row['sum_cost_basis'] += h['cost_basis']
+                    row['has_cost_basis'] = True
+                if h['is_option'] and row['occ'] is None:
+                    row['occ'] = _pdf_option_to_occ(h['name'])
+                if not h['is_option']:
+                    row['ticker'] = h['symbol']
+
+        # Fetch current prices
+        equity_tickers = tuple(sorted(set(v['ticker'] for v in aggregated.values() if v['ticker'])))
+        opt_occs = tuple(sorted(set(v['occ'] for v in aggregated.values() if v['occ'])))
+
+        eq_prices = {}
+        opt_price_data = {}
+        if equity_tickers:
+            with st.spinner("Fetching current equity prices…"):
+                eq_prices = fetch_summary_equity_prices(equity_tickers)
+        if opt_occs:
+            with st.spinner("Fetching current option prices…"):
+                opt_price_data = fetch_watchlist_prices(opt_occs)
+
+        # Build display rows
+        table_rows = []
+        for disp, row in aggregated.items():
+            qty = row['sum_qty']
+            cost_basis = row['sum_cost_basis'] if row['has_cost_basis'] else None
+            avg_cost = (cost_basis / abs(qty)) if (cost_basis and qty) else None
+
+            if row['is_option']:
+                occ = row['occ']
+                opt_d = opt_price_data.get(occ, {}) if occ else {}
+                curr_price = opt_d.get('option_price')
+            else:
+                curr_price = eq_prices.get(row['ticker'])
+
+            curr_value = (curr_price * qty) if curr_price is not None else None
+            gain_loss  = (curr_value - cost_basis) if (curr_value is not None and cost_basis is not None) else None
+            pct_gl     = (gain_loss / abs(cost_basis) * 100) if (gain_loss is not None and cost_basis) else None
+
+            table_rows.append({
+                '_symbol': disp,
+                '_is_option': row['is_option'],
+                '_curr_value_raw': curr_value,
+                'Symbol': disp,
+                'Sum Qty': qty,
+                'Cost Basis': cost_basis,
+                'Avg Cost': avg_cost,
+                'Curr Price': curr_price,
+                'Curr Value': curr_value,
+                'Gain/Loss': gain_loss,
+                '% G/L': pct_gl,
+                'Alloc%': None,  # filled below
+            })
+
+        total_curr_value = sum(r['_curr_value_raw'] or 0 for r in table_rows)
+        for r in table_rows:
+            cv = r['_curr_value_raw']
+            r['Alloc%'] = (cv / total_curr_value * 100) if (cv and total_curr_value) else None
+
+        def _make_holdings_df(rows):
+            df = pd.DataFrame(rows, columns=[
+                'Symbol', 'Sum Qty', 'Cost Basis', 'Avg Cost',
+                'Curr Price', 'Curr Value', 'Gain/Loss', '% G/L', 'Alloc%'
+            ])
+            df = df.sort_values('Curr Value', key=lambda x: x.abs().fillna(0), ascending=False)
+
+            def fmt_dollar(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return '—'
+                return f"${v:,.2f}"
+
+            def fmt_pct(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return '—'
+                sign = '+' if v > 0 else ''
+                return f"{sign}{v:.2f}%"
+
+            def fmt_qty(v):
+                if v is None:
+                    return '—'
+                return f"{v:,.4g}"
+
+            def fmt_gl(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return '—'
+                sign = '+' if v > 0 else ''
+                return f"{sign}${v:,.2f}"
+
+            df['Sum Qty']    = df['Sum Qty'].map(fmt_qty)
+            df['Cost Basis'] = df['Cost Basis'].map(fmt_dollar)
+            df['Avg Cost']   = df['Avg Cost'].map(fmt_dollar)
+            df['Curr Price'] = df['Curr Price'].map(fmt_dollar)
+            df['Curr Value'] = df['Curr Value'].map(fmt_dollar)
+            df['Gain/Loss']  = df['Gain/Loss'].map(fmt_gl)
+            df['% G/L']      = df['% G/L'].map(fmt_pct)
+            df['Alloc%']     = df['Alloc%'].map(lambda v: f"{v:.2f}%" if v is not None and not (isinstance(v, float) and pd.isna(v)) else '—')
+            return df
+
+        eq_rows  = [r for r in table_rows if not r['_is_option']]
+        opt_rows = [r for r in table_rows if r['_is_option']]
+
+        col_r, col_r2, _ = st.columns([1, 1, 3])
+        if col_r.button("Refresh Prices", key="sum_refresh"):
+            fetch_summary_equity_prices.clear()
+            fetch_watchlist_prices.clear()
+            st.rerun()
+        if col_r2.button("Reload PDFs", key="sum_reload_pdf"):
+            parse_portfolio_pdfs.clear()
+            st.rerun()
+
+        if eq_rows:
+            with st.expander(f"Equities & ETFs ({len(eq_rows)})", expanded=True):
+                st.dataframe(_make_holdings_df(eq_rows), use_container_width=True, hide_index=True)
+        if opt_rows:
+            with st.expander(f"Options ({len(opt_rows)})", expanded=False):
+                st.dataframe(_make_holdings_df(opt_rows), use_container_width=True, hide_index=True)
 
 with page_tab2:
     watchlist = load_watchlist()

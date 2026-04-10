@@ -1,1 +1,2 @@
-OCC_Symbol,Side,Quantity,Entry_Price,Target_Price
+Ticker,ExpirationYYMMDD,OptionType,Strike,Side,Quantity,Entry_Price,Target_Price,SpreadId,Spread_Target
+NVDA,260515,C,190.0,Short,1,5.0,1.8,,
