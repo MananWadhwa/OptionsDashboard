@@ -8,9 +8,13 @@ NKE,,,,,buy,,stock
 PYPL,,,,,buy,,stock
 NOW,,,,,buy,,stock
 FREL,,,,,buy,,stock
-META,260522.0,C,700.0,13.5,Sell,,option
 LULU,260515.0,C,180.0,3.6,Sell,RH-Reopen,option
 LULU,,,,175.0,sell,,stock
 ORCL,,,,170.0,sell,,stock
 IBIT,,,,,buy,,stock
 IBIT,260529.0,C,47.0,1.2,sell,,option
+BRK-B,,,,,buy,,stock
+ARKK,,,,,buy,,stock
+JD,,,,,buy,,stock
+PYPL,,,,,buy,,stock
+IBIT,260529.0,C,50.0,2.0,sell,IBIT-FD-TI Sell,option
