@@ -261,6 +261,11 @@ def fetch_option_data(occ_list):
     results = []
     r = 0.045
 
+    # Deduplicate OCC symbols so the same contract from multiple accounts
+    # doesn't produce duplicate rows in market_data (which would cause a
+    # many-to-many merge and show each position twice in the table).
+    occ_list = list(dict.fromkeys(occ_list))
+
     # Group OCCs by ticker so we fetch each ticker's spot/chain only once
     from collections import defaultdict
     by_ticker = defaultdict(list)
@@ -274,7 +279,7 @@ def fetch_option_data(occ_list):
         if i > 0:
             time.sleep(0.5)
         try:
-            underlying_ticker = yf.Ticker(ticker_sym)
+            underlying_ticker = yf.Ticker(yf_ticker(ticker_sym))
             
             def fetch_spot_and_vol(t):
                 hist = t.history(period="1y", prepost=True)['Close']
@@ -292,9 +297,15 @@ def fetch_option_data(occ_list):
                 hist_vol = 0.25
 
             # Fetch each unique expiration once per ticker
+            available_exps = list(underlying_ticker.options)
             chains = {}
             for occ, (_, expiration, _, _) in contracts:
                 if expiration not in chains:
+                    if expiration not in available_exps:
+                        close = [e for e in available_exps if abs((datetime.strptime(e, "%Y-%m-%d") - datetime.strptime(expiration, "%Y-%m-%d")).days) <= 7]
+                        st.warning(f"Expiration {expiration} not available on Yahoo Finance for {ticker_sym}. Available near this date: {close or available_exps[:5]}")
+                        chains[expiration] = None
+                        continue
                     try:
                         chains[expiration] = _yf_fetch_with_retry(
                             lambda t=underlying_ticker, e=expiration: t.option_chain(e)
@@ -312,11 +323,15 @@ def fetch_option_data(occ_list):
                     contract = options[options['strike'] == strike]
 
                     if contract.empty:
-                        st.warning(f"Could not find contract for {occ}. Strike {strike} may not be available (spot: {spot_price:.2f}).")
+                        available_strikes = sorted(options['strike'].tolist())
+                        closest = min(available_strikes, key=lambda s: abs(s - strike)) if available_strikes else None
+                        st.warning(f"Strike {strike} not in Yahoo Finance chain for {occ} (spot: {spot_price:.2f}). Closest available: {closest}. Range: {available_strikes[:3]}…{available_strikes[-3:]}")
                         continue
 
                     fetched_option_price = contract['lastPrice'].values[0]
-                    last_price = fetched_option_price
+                    bid = float(contract['bid'].values[0]) if 'bid' in contract.columns else 0.0
+                    ask = float(contract['ask'].values[0]) if 'ask' in contract.columns else 0.0
+                    last_price = (bid + ask) / 2.0 if bid > 0 and ask > 0 else fetched_option_price
                     iv         = contract['impliedVolatility'].values[0]
 
                     if pd.isna(iv) or iv < 0.05:
@@ -368,9 +383,19 @@ def fetch_option_data(occ_list):
 
     return pd.DataFrame(results)
 
+def occ_ticker(ticker):
+    """Returns the OCC-safe ticker (strips hyphens, e.g. BRK-B → BRKB)."""
+    return ticker.upper().replace('-', '')
+
+def yf_ticker(occ_tick):
+    """Maps an OCC ticker back to the Yahoo Finance ticker symbol.
+    Known mappings: BRKB → BRK-B. Falls back to the OCC ticker itself."""
+    _MAP = {'BRKB': 'BRK-B'}
+    return _MAP.get(occ_tick.upper(), occ_tick.upper())
+
 def construct_occ_from_row(row):
     """Constructs a standard OCC option symbol from a DataFrame row."""
-    ticker = row['Ticker']
+    ticker = occ_ticker(row['Ticker'])
     exp_str = str(row['ExpirationYYMMDD'])
     yy = exp_str[:2]
     mm = exp_str[2:4]
@@ -378,7 +403,7 @@ def construct_occ_from_row(row):
     opt_type = row['OptionType']
     strike = row['Strike']
     strike_formatted = f"{int(strike * 1000):08d}"
-    return f"{ticker.upper()}{yy}{mm}{dd}{opt_type.upper()}{strike_formatted}"
+    return f"{ticker}{yy}{mm}{dd}{opt_type.upper()}{strike_formatted}"
 
 def save_account_to_file(all_positions_df, account):
     """Saves all positions for a given account back to its CSV file."""
@@ -611,7 +636,7 @@ st.markdown(
     'padding:4px 0 10px;letter-spacing:0.01em;">Options Tracker</div>',
     unsafe_allow_html=True
 )
-page_tab1, page_tab2, page_tab3, page_tab4 = st.tabs(["Portfolio", "Watchlist", "Sentiment", "Summary"])
+page_tab1, page_tab2, page_tab3, page_tab4, page_tab5 = st.tabs(["Portfolio", "Watchlist", "Sentiment", "Summary", "Trades"])
 
 with page_tab1:
     # Load Positions from multiple files
@@ -635,7 +660,7 @@ with page_tab1:
                 'Ticker', 'ExpirationYYMMDD', 'OptionType', 'Strike', 'Side',
                 'Quantity', 'Entry_Price', 'Target_Price', 'SpreadId', 'Spread_Target'
             ]
-            df = pd.read_csv(file, header=None, skiprows=1, names=column_names)
+            df = pd.read_csv(file, header=None, skiprows=1, names=column_names, comment='#')
             df['Account'] = account_name
             all_positions.append(df)
 
@@ -657,13 +682,17 @@ with page_tab1:
         st.session_state['pf_live'] = False
     if 'pf_interval' not in st.session_state:
         st.session_state['pf_interval'] = 30
+    if 'pf_sort' not in st.session_state:
+        st.session_state['pf_sort'] = 'Expiry'
 
-    pf_ctrl1, pf_ctrl2, pf_ctrl3 = st.columns([2, 2, 4])
+    pf_ctrl1, pf_ctrl2, pf_ctrl3, pf_ctrl4 = st.columns([2, 2, 2, 2])
     pf_live_on = pf_ctrl1.toggle("Live Quotes", value=st.session_state['pf_live'], key="pf_live_toggle")
     st.session_state['pf_live'] = pf_live_on
     if pf_live_on:
         pf_interval = pf_ctrl2.selectbox("Refresh every", [15, 30, 60, 120], index=1, format_func=lambda x: f"{x}s", key="pf_interval_sel")
         st.session_state['pf_interval'] = pf_interval
+    pf_sort = pf_ctrl3.selectbox("Sort by", ["Expiry", "Symbol"], index=0 if st.session_state['pf_sort'] == 'Expiry' else 1, key="pf_sort_sel")
+    st.session_state['pf_sort'] = pf_sort
 
     # Account filter
     accounts = ["All"] + positions['Account'].unique().tolist()
@@ -825,6 +854,27 @@ with page_tab1:
             st.stop()
 
         display_df = pd.concat(processed_positions, ignore_index=True)
+
+        # Extract sort keys before OCC_Symbol is converted to HTML
+        def _occ_sort_keys(sym):
+            parsed = parse_occ(sym)
+            if parsed:
+                return parsed[0], parsed[1]  # ticker, YYYY-MM-DD expiry
+            # Spread names like "META 260529 720/700P" — parts[0]=ticker, parts[1]=YYMMDD
+            parts = sym.split()
+            ticker_part = parts[0] if parts else sym
+            exp_part = f"20{parts[1][:2]}-{parts[1][2:4]}-{parts[1][4:]}" if len(parts) > 1 and len(parts[1]) == 6 else parts[1] if len(parts) > 1 else ''
+            return ticker_part, exp_part
+
+        sort_keys = display_df['OCC_Symbol'].apply(_occ_sort_keys)
+        display_df['_sort_ticker'] = sort_keys.apply(lambda x: x[0])
+        display_df['_sort_expiry'] = sort_keys.apply(lambda x: x[1])
+
+        if st.session_state.get('pf_sort', 'Expiry') == 'Symbol':
+            display_df = display_df.sort_values(['Account', '_sort_ticker', '_sort_expiry']).reset_index(drop=True)
+        else:
+            display_df = display_df.sort_values(['Account', '_sort_expiry', '_sort_ticker']).reset_index(drop=True)
+
         display_df['OCC_Symbol'] = display_df['OCC_Symbol'].apply(format_occ_for_display).apply(format_occ_html)
 
         display_df = display_df[[
@@ -1123,6 +1173,36 @@ with page_tab1:
 WATCHLIST_FILE = "positions/watchlist.csv"
 WATCHLIST_COLS = ['Ticker', 'ExpirationYYMMDD', 'OptionType', 'Strike', 'TargetPrice', 'Intent', 'Label', 'ItemType']
 
+TRADES_FILE = "positions/trades.csv"
+TRADES_COLS = ['id', 'date', 'ticker', 'strategy', 'event_type', 'qty',
+               'strike', 'expiry', 'option_type', 'price', 'fees',
+               'account_type', 'capital_reserved', 'notes']
+
+TRADE_EVENTS = [
+    "Buy Stock", "Sell Stock",
+    "Sell Covered Call", "Buy to Close (Call)",
+    "Sell Cash-Secured Put", "Buy to Close (Put)",
+    "Assigned (Call)", "Assigned (Put)",
+    "Expired Worthless", "Dividend",
+]
+_OPTION_SELL_EVENTS  = {"Sell Covered Call", "Sell Cash-Secured Put"}
+_OPTION_CLOSE_EVENTS = {"Buy to Close (Call)", "Buy to Close (Put)"}
+_ASSIGN_EVENTS       = {"Assigned (Call)", "Assigned (Put)"}
+_OPTION_EVENTS       = _OPTION_SELL_EVENTS | _OPTION_CLOSE_EVENTS | _ASSIGN_EVENTS | {"Expired Worthless"}
+
+EVENT_COLORS = {
+    "Buy Stock":             "#60a5fa",
+    "Sell Stock":            "#a78bfa",
+    "Sell Covered Call":     "#22c55e",
+    "Buy to Close (Call)":   "#f87171",
+    "Sell Cash-Secured Put": "#22c55e",
+    "Buy to Close (Put)":    "#f87171",
+    "Assigned (Call)":       "#fb923c",
+    "Assigned (Put)":        "#fb923c",
+    "Expired Worthless":     "#4ade80",
+    "Dividend":              "#34d399",
+}
+
 @st.cache_data(ttl=120)
 def fetch_watchlist_prices(occ_list):
     """Fetches current option price, underlying spot price, and delta for watchlist items."""
@@ -1143,12 +1223,22 @@ def fetch_watchlist_prices(occ_list):
             if contract.empty:
                 results[occ] = {'option_price': None, 'spot': spot, 'delta': None, 'gamma': None}
                 continue
-            option_price = float(contract['lastPrice'].values[0])
-            iv = float(contract['impliedVolatility'].values[0])
+            last_price = float(contract['lastPrice'].values[0])
+            bid = float(contract['bid'].values[0]) if 'bid' in contract.columns else 0.0
+            ask = float(contract['ask'].values[0]) if 'ask' in contract.columns else 0.0
+            # Prefer bid/ask mid (live quotes) over lastPrice (stale for low-volume OTM options)
+            if bid > 0 and ask > 0:
+                option_price = (bid + ask) / 2.0
+            else:
+                option_price = last_price
             days_to_exp = (datetime.strptime(expiration, "%Y-%m-%d") - datetime.now()).days
             T = max(days_to_exp / 365.0, 0.001)
+            # Recompute IV from the price we're actually using (bid/ask mid may differ from lastPrice)
+            iv = implied_volatility(option_price, spot, strike, T, r_free, 0.0, opt_type)
+            if iv is None or iv <= 0:
+                iv = float(contract['impliedVolatility'].values[0])  # fall back to Yahoo's value
             delta, _, gamma = calculate_greeks(spot, strike, T, r_free, iv, opt_type)
-            
+
             # Use approximation if option data timestamp is different from stock price timestamp
             if 'lastTradeDate' in contract.columns:
                 trade_time = pd.to_datetime(contract['lastTradeDate'].values[0])
@@ -1157,15 +1247,15 @@ def fetch_watchlist_prices(occ_list):
                 stock_time = stock_date
                 if stock_time.tzinfo is None:
                     stock_time = stock_time.tz_localize('UTC')
-                
+
                 if trade_time < stock_time and iv > 0:
                     approx_price, _ = approximate_realtime_option_price(underlying_ticker, ticker, spot, strike, option_price, trade_time, expiration, opt_type)
                     if approx_price > 0:
                         option_price = approx_price
             
-            results[occ] = {'option_price': option_price, 'spot': spot, 'delta': delta, 'gamma': gamma}
+            results[occ] = {'option_price': option_price, 'spot': spot, 'delta': delta, 'gamma': gamma, 'iv': iv, 'strike': strike, 'T': T, 'opt_type': opt_type}
         except Exception:
-            results[occ] = {'option_price': None, 'spot': None, 'delta': None, 'gamma': None}
+            results[occ] = {'option_price': None, 'spot': None, 'delta': None, 'gamma': None, 'iv': None, 'strike': None, 'T': None, 'opt_type': None}
     return results
 
 def load_watchlist():
@@ -1182,6 +1272,126 @@ def load_watchlist():
 
 def save_watchlist(df):
     df[WATCHLIST_COLS].to_csv(WATCHLIST_FILE, index=False)
+
+# ---- TRADES helpers ----
+def load_trades():
+    if not os.path.exists(TRADES_FILE):
+        return pd.DataFrame(columns=TRADES_COLS)
+    df = pd.read_csv(TRADES_FILE)
+    for col in TRADES_COLS:
+        if col not in df.columns:
+            df[col] = ''
+    df['date']             = pd.to_datetime(df['date'], errors='coerce')
+    df['qty']              = pd.to_numeric(df['qty'],              errors='coerce').fillna(0)
+    df['price']            = pd.to_numeric(df['price'],            errors='coerce').fillna(0)
+    df['fees']             = pd.to_numeric(df['fees'],             errors='coerce').fillna(0)
+    df['strike']           = pd.to_numeric(df['strike'],           errors='coerce')
+    df['capital_reserved'] = pd.to_numeric(df['capital_reserved'], errors='coerce')
+    return df.sort_values('date', ascending=False).reset_index(drop=True)
+
+def save_trades(df):
+    out = df.copy()
+    out['date'] = pd.to_datetime(out['date']).dt.strftime('%Y-%m-%d')
+    out[TRADES_COLS].to_csv(TRADES_FILE, index=False)
+
+def trade_cash_flow(row):
+    """Signed cash flow: positive = money received, negative = money paid out."""
+    et     = str(row.get('event_type', ''))
+    qty    = float(row.get('qty',   0) or 0)
+    price  = float(row.get('price', 0) or 0)
+    fees   = float(row.get('fees',  0) or 0)
+    strike_raw = row.get('strike')
+    strike = float(strike_raw) if pd.notna(strike_raw) and strike_raw != '' else 0.0
+
+    if et == "Buy Stock":
+        return -(qty * price) - fees
+    elif et == "Sell Stock":
+        return  (qty * price) - fees
+    elif et in _OPTION_SELL_EVENTS:          # premium received
+        return  (qty * 100 * price) - fees
+    elif et in _OPTION_CLOSE_EVENTS:         # cost to close
+        return -(qty * 100 * price) - fees
+    elif et == "Assigned (Call)":            # shares called away at strike
+        return  (qty * 100 * strike) - fees
+    elif et == "Assigned (Put)":             # forced to buy at strike
+        return -(qty * 100 * strike) - fees
+    elif et == "Expired Worthless":
+        return -fees
+    elif et == "Dividend":
+        return price - fees                  # price = total dividend amount
+    return 0.0
+
+@st.cache_data(ttl=3600)
+def fetch_benchmark_history(tickers_tuple, start_date_str):
+    """Fetch daily Close prices for benchmark tickers from start_date to today."""
+    result = {}
+    for t in tickers_tuple:
+        try:
+            hist = yf.download(t, start=start_date_str, progress=False, auto_adjust=True)
+            if not hist.empty:
+                close = hist['Close'].squeeze()
+                if hasattr(close, 'iloc'):
+                    result[t] = close
+        except Exception:
+            pass
+    return result
+
+@st.cache_data(ttl=120)
+def fetch_trade_live_prices(tickers_tuple):
+    """Fetch current prices for open stock positions tracked in the trades journal."""
+    result = {}
+    for ticker in tickers_tuple:
+        try:
+            t = yf.Ticker(ticker)
+            price, _ = get_latest_price(t)
+            result[ticker] = price
+        except Exception:
+            result[ticker] = None
+    return result
+
+def compute_open_stock_positions(trades_df):
+    """
+    Walk trades chronologically and return open share positions.
+    Returns dict: {ticker: {'shares': float, 'cost_basis': float}}
+    cost_basis = total cash paid to acquire the shares still held.
+    """
+    positions = {}   # ticker -> {'shares': float, 'cost_basis': float}
+    for _, row in trades_df.sort_values('date').iterrows():
+        et     = str(row.get('event_type', ''))
+        ticker = str(row.get('ticker', '')).upper()
+        qty    = float(row.get('qty', 0) or 0)
+        price  = float(row.get('price', 0) or 0)
+        strike_raw = row.get('strike')
+        strike = float(strike_raw) if pd.notna(strike_raw) and str(strike_raw) not in ('', 'nan') else 0.0
+
+        pos = positions.setdefault(ticker, {'shares': 0.0, 'cost_basis': 0.0})
+
+        if et == "Buy Stock":
+            shares_added = qty
+            cost_added   = qty * price
+            pos['cost_basis'] += cost_added
+            pos['shares']     += shares_added
+
+        elif et == "Sell Stock":
+            if pos['shares'] > 0:
+                avg = pos['cost_basis'] / pos['shares']
+                pos['cost_basis'] -= avg * min(qty, pos['shares'])
+            pos['shares'] = max(0.0, pos['shares'] - qty)
+
+        elif et == "Assigned (Put)":
+            shares_added = qty * 100
+            cost_added   = shares_added * strike
+            pos['cost_basis'] += cost_added
+            pos['shares']     += shares_added
+
+        elif et == "Assigned (Call)":
+            # Shares called away — reduce position
+            if pos['shares'] > 0:
+                avg = pos['cost_basis'] / pos['shares']
+                pos['cost_basis'] -= avg * min(qty * 100, pos['shares'])
+            pos['shares'] = max(0.0, pos['shares'] - qty * 100)
+
+    return {t: p for t, p in positions.items() if p['shares'] > 0}
 
 def watchlist_occ(row):
     exp_str = str(int(row['ExpirationYYMMDD']))
@@ -1203,6 +1413,10 @@ def watchlist_card_html(row, data):
     spot          = data.get('spot')          if data else None
     delta         = data.get('delta')         if data else None
     gamma         = data.get('gamma')         if data else None
+    iv            = data.get('iv')            if data else None
+    bs_strike     = data.get('strike')        if data else None
+    bs_T          = data.get('T')             if data else None
+    bs_opt_type   = data.get('opt_type')      if data else None
 
     strike_disp = int(strike) if strike == int(strike) else strike
     target_disp = int(target) if target == int(target) else target
@@ -1213,28 +1427,23 @@ def watchlist_card_html(row, data):
     else:
         hit = False
 
-    # Stock move needed: delta-gamma quadratic is more accurate than delta-only for large moves.
-    # Solve: ½·gamma·dS² + delta·dS - dOption = 0
-    # dS = (-delta ± sqrt(delta² + 2·gamma·dOption)) / gamma
-    # Fall back to delta-only (dS = dOption/delta) when gamma is negligible.
+    # Stock price needed for option to reach target: solve BS(S*) = target via bisection.
+    # This is exact and handles large moves correctly, unlike delta-gamma approximation.
     stock_target_str = "N/A"
-    if spot is not None and delta is not None and delta != 0 and current_price is not None:
-        d_option = target - current_price
-        if gamma is not None and abs(gamma) > 1e-8:
-            discriminant = delta ** 2 + 2 * gamma * d_option
-            if discriminant >= 0:
-                # Two roots — pick the one consistent with the direction delta implies
-                sqrt_disc = np.sqrt(discriminant)
-                ds1 = (-delta + sqrt_disc) / gamma
-                ds2 = (-delta - sqrt_disc) / gamma
-                # delta sign tells us which direction the stock should move
-                ds = ds1 if (delta > 0 and ds1 > ds2) or (delta < 0 and ds1 < ds2) else ds2
-            else:
-                # No real solution (target unreachable with current IV/time); fall back
-                ds = d_option / delta
-        else:
-            ds = d_option / delta
-        stock_target_str = f"${spot + ds:,.2f}"
+    if (spot is not None and current_price is not None and iv is not None and iv > 0
+            and bs_strike is not None and bs_T is not None and bs_opt_type is not None):
+        try:
+            r_free = 0.045
+            def bs_diff(s):
+                return black_scholes(s, bs_strike, bs_T, r_free, 0.0, iv, bs_opt_type) - target
+            # Search range: 1% to 5x current spot
+            lo, hi = spot * 0.01, spot * 5.0
+            if bs_diff(lo) * bs_diff(hi) < 0:
+                s_star = brentq(bs_diff, lo, hi, xtol=0.01)
+                stock_target_str = f"${s_star:,.2f}"
+            # else: target is outside achievable range at current IV/T — leave as N/A
+        except Exception:
+            pass
 
     border_color = '#22c55e' if hit else '#3b82f6'
     bg_color     = 'rgba(34,197,94,0.08)' if hit else 'rgba(59,130,246,0.06)'
@@ -1932,6 +2141,44 @@ def fetch_sentiment_prices(tickers):
             results[ticker_id] = {"error": str(e), "name": ticker_info["name"]}
     return results
 
+@st.cache_data(ttl=300)
+def fetch_ibit_approx():
+    """Estimate current IBIT price using BTC-USD ratio (useful when market is closed)."""
+    try:
+        ibit = yf.Ticker("IBIT")
+        btc = yf.Ticker("BTC-USD")
+
+        ibit_hist = ibit.history(period="5d", interval="1d")
+        btc_hist = btc.history(period="5d", interval="1d")
+
+        if ibit_hist.empty or btc_hist.empty:
+            return {"error": "No data", "name": "IBIT ~", "approx": True}
+
+        ibit_close = float(ibit_hist['Close'].iloc[-1])
+
+        # Match BTC close to last IBIT trading day
+        ibit_last_date = ibit_hist.index[-1].date()
+        btc_same_day = btc_hist[[d.date() == ibit_last_date for d in btc_hist.index]]
+        btc_close = float(btc_same_day['Close'].iloc[-1]) if not btc_same_day.empty else float(btc_hist['Close'].iloc[-1])
+
+        ratio = ibit_close / btc_close  # IBIT price per $1 of BTC
+
+        btc_current, _ = get_latest_price(btc)
+        approx_price = ratio * btc_current
+        change = approx_price - ibit_close
+        change_pct = (change / ibit_close * 100) if ibit_close else 0
+
+        return {
+            "name": "IBIT ~",
+            "price": approx_price,
+            "change": change,
+            "change_pct": change_pct,
+            "color": "#F7931A",
+            "approx": True,
+        }
+    except Exception as e:
+        return {"error": str(e), "name": "IBIT ~", "approx": True}
+
 @st.cache_data(ttl=1800)  # cache 30 min
 def fetch_cnn_fear_greed():
     """Fetches CNN Fear & Greed index via their internal data endpoint."""
@@ -2085,6 +2332,12 @@ with page_tab3:
     }
     prices = fetch_sentiment_prices(tickers_to_fetch)
 
+    # Inject approximate IBIT price derived from live BTC
+    if sent_live_on:
+        fetch_ibit_approx.clear()
+    ibit_approx = fetch_ibit_approx()
+    prices["IBIT"] = ibit_approx
+
     sent_updated_str = datetime.now().strftime("%H:%M:%S")
     sent_status_color = '#22c55e' if sent_live_on else '#6B7280'
     sent_live_badge = (
@@ -2095,13 +2348,20 @@ with page_tab3:
 
     prices_html = '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;">'
     for ticker_id, data in prices.items():
+        is_approx = data.get("approx", False)
         if "error" in data:
             price_html = f'<span style="color:#f87171;font-size:0.9em;">Error</span>'
         else:
             change_color = '#22c55e' if data['change'] >= 0 else '#f87171'
             arrow = '▲' if data['change'] >= 0 else '▼'
+            approx_badge = (
+                '<span style="color:#6B7280;font-size:0.65em;font-weight:500;'
+                'background:#2d3748;padding:1px 5px;border-radius:4px;margin-left:4px;">est</span>'
+                if is_approx else ''
+            )
             price_html = (
                 f'<span style="color:#e2e8f0;font-size:1.15em;font-weight:700;">${data["price"]:,.2f}</span>'
+                f'{approx_badge}'
                 f'<span style="color:{change_color};font-size:0.85em;font-weight:600;margin-left:8px;">'
                 f'{arrow} {abs(data["change"]):,.2f} ({data["change_pct"]:+.2f}%)</span>'
             )
@@ -2161,9 +2421,10 @@ with page_tab3:
         fetch_cnn_fear_greed.clear()
         fetch_crypto_fear_greed.clear()
         fetch_sentiment_prices.clear()
+        fetch_ibit_approx.clear()
         st.rerun()
 
-    st.caption("Prices via Yahoo Finance. CNN/Crypto indices refresh every 30 min.")
+    st.caption("Prices via Yahoo Finance. CNN/Crypto indices refresh every 30 min. IBIT ~ = estimated from live BTC price.")
 
     if sent_live_on:
         sent_countdown = st.empty()
@@ -2175,4 +2436,543 @@ with page_tab3:
             time.sleep(1)
         sent_countdown.empty()
         fetch_sentiment_prices.clear()
-        st.rerun()
+        fetch_ibit_approx.clear()
+
+# =====================================================================
+# --- TRADES TAB ---
+# =====================================================================
+@st.fragment
+def _trades_tab():
+    st.markdown('<div style="font-size:1em;font-weight:700;color:#e2e8f0;padding:2px 0 10px;">Trade Journal</div>', unsafe_allow_html=True)
+
+    trades = load_trades()
+    tr_journal, tr_add, tr_perf = st.tabs(["Journal", "Add Trade", "Performance"])
+
+    # ------------------------------------------------------------------
+    # JOURNAL
+    # ------------------------------------------------------------------
+    with tr_journal:
+        if trades.empty:
+            st.info("No trades yet. Use **Add Trade** to log your first trade.")
+        else:
+            def _trade_card_html(row):
+                et       = str(row.get('event_type', ''))
+                color    = EVENT_COLORS.get(et, "#6b7280")
+                dt       = row['date']
+                date_str = dt.strftime('%b %d, %Y') if pd.notna(dt) else '—'
+                is_opt   = et in _OPTION_EVENTS
+                qty      = float(row.get('qty',  0) or 0)
+                price    = float(row.get('price',0) or 0)
+                strike_raw = row.get('strike')
+                strike   = float(strike_raw) if pd.notna(strike_raw) and str(strike_raw) not in ('', 'nan') else None
+                expiry   = str(row.get('expiry','')) if pd.notna(row.get('expiry')) else ''
+                opt_t    = str(row.get('option_type','')) if pd.notna(row.get('option_type')) else ''
+                notes    = str(row.get('notes','')) if pd.notna(row.get('notes')) and str(row.get('notes','')) not in ('', 'nan') else ''
+                acct     = str(row.get('account_type','')) if pd.notna(row.get('account_type')) and str(row.get('account_type','')) not in ('', 'nan') else ''
+
+                if et == "Dividend":
+                    detail = f"${price:,.2f} received"
+                elif is_opt:
+                    parts = [f"{int(qty)} contract{'s' if qty!=1 else ''}"]
+                    if strike: parts.append(f"${strike:.0f}{opt_t}")
+                    if expiry: parts.append(f"exp {expiry}")
+                    if price:  parts.append(f"@ ${price:.2f}/sh")
+                    detail = " · ".join(parts)
+                else:
+                    detail = f"{int(qty)} shares @ ${price:.2f}"
+
+                cf       = trade_cash_flow(row)
+                cf_str   = f"+${cf:,.2f}" if cf >= 0 else f"-${abs(cf):,.2f}"
+                cf_color = "#22c55e" if cf >= 0 else "#f87171"
+                acct_badge = (
+                    f'<span style="background:#1e3a2f;color:#4ade80;font-size:0.65em;'
+                    f'padding:1px 6px;border-radius:6px;margin-left:6px;">{acct}</span>'
+                ) if acct else ''
+                notes_html = (
+                    f'<div style="color:#6b7280;font-size:0.75em;margin-top:3px;">{notes}</div>'
+                ) if notes else ''
+
+                return f"""
+<div style="background:#151a27;border-left:3px solid {color};border-radius:6px;
+            padding:8px 12px;margin-bottom:5px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px;">
+    <div>
+      <span style="color:{color};font-weight:700;font-size:0.85em;">{et}</span>{acct_badge}
+    </div>
+    <div style="text-align:right;">
+      <span style="color:{cf_color};font-weight:700;">{cf_str}</span>
+      <span style="color:#6b7280;font-size:0.75em;margin-left:8px;">{date_str}</span>
+    </div>
+  </div>
+  <div style="color:#94a3b8;font-size:0.8em;margin-top:2px;">{detail}</div>{notes_html}
+</div>"""
+
+            # Group by strategy
+            strategies = sorted(trades['strategy'].dropna().astype(str).unique().tolist())
+            for strat in strategies:
+                strat_trades = trades[trades['strategy'] == strat].copy()
+                strat_trades['_cf'] = strat_trades.apply(trade_cash_flow, axis=1)
+                strat_cf   = strat_trades['_cf'].sum()
+                n_trades   = len(strat_trades)
+                ticker     = str(strat_trades['ticker'].iloc[0]).upper() if not strat_trades.empty else ''
+                cf_color   = "#22c55e" if strat_cf >= 0 else "#f87171"
+                cf_str     = f"+${strat_cf:,.2f}" if strat_cf >= 0 else f"-${abs(strat_cf):,.2f}"
+
+                with st.expander(
+                    f"{strat}  ·  {ticker}  ·  {n_trades} trade{'s' if n_trades != 1 else ''}  ·  {cf_str}",
+                    expanded=False
+                ):
+                    for _, row in strat_trades.sort_values('date').iterrows():
+                        st.markdown(_trade_card_html(row), unsafe_allow_html=True)
+
+            st.divider()
+            with st.expander("Delete a Trade"):
+                def _tr_del_label(r):
+                    dt_s = r['date'].strftime('%Y-%m-%d') if pd.notna(r['date']) else '?'
+                    return f"{dt_s} | {r['event_type']} | {str(r['ticker']).upper()} | id#{int(r['id']) if pd.notna(r.get('id')) else '?'}"
+                del_labels = [_tr_del_label(r) for _, r in trades.iterrows()]
+                del_sel = st.selectbox("Select trade to delete", del_labels, key="tr_del_sel")
+                del_idx = del_labels.index(del_sel)
+                st.warning(f"Permanently delete: **{del_sel}**?")
+                if st.button("Delete Trade", type="primary", key="tr_del_btn"):
+                    save_trades(trades.drop(index=del_idx).reset_index(drop=True))
+                    st.success("Trade deleted.")
+                    st.rerun()
+
+    # ------------------------------------------------------------------
+    # ADD TRADE
+    # ------------------------------------------------------------------
+    with tr_add:
+        existing_strategies = (
+            sorted(trades['strategy'].dropna().astype(str).unique().tolist())
+            if not trades.empty else []
+        )
+
+        event_type = st.selectbox("Event Type", TRADE_EVENTS, key="tr_add_event")
+        is_opt_sell  = event_type in _OPTION_SELL_EVENTS
+        is_opt_close = event_type in _OPTION_CLOSE_EVENTS
+        is_assign    = event_type in _ASSIGN_EVENTS
+        is_expired   = event_type == "Expired Worthless"
+        is_dividend  = event_type == "Dividend"
+
+        # For assignment / close / expiry: pick the originating sell trade
+        # and pre-fill everything from it.
+        _ref_source = {
+            "Assigned (Put)":        "Sell Cash-Secured Put",
+            "Assigned (Call)":       "Sell Covered Call",
+            "Buy to Close (Put)":    "Sell Cash-Secured Put",
+            "Buy to Close (Call)":   "Sell Covered Call",
+            "Expired Worthless":     None,   # either type — show all sell trades
+        }
+        needs_ref = event_type in _ref_source
+
+        # Build the list of open sell-option trades the user can reference
+        if needs_ref:
+            src_event = _ref_source[event_type]
+            if src_event:
+                ref_pool = trades[trades['event_type'] == src_event].copy()
+            else:
+                ref_pool = trades[trades['event_type'].isin(_OPTION_SELL_EVENTS)].copy()
+
+            def _ref_label(r):
+                exp = str(r.get('expiry','')) if pd.notna(r.get('expiry')) else '?'
+                stk = f"${float(r['strike']):.0f}" if pd.notna(r.get('strike')) else '?'
+                ot  = str(r.get('option_type',''))
+                qty = int(r.get('qty', 0))
+                return (f"{str(r['ticker']).upper()} {ot} {stk} exp {exp} "
+                        f"({qty} contract{'s' if qty!=1 else ''}) — {r['strategy']}")
+
+            if ref_pool.empty:
+                st.warning(f"No open '{src_event or 'sell option'}' trades found to link. "
+                           "Log the original sell trade first.")
+                ref_row = None
+            else:
+                ref_labels = [_ref_label(r) for _, r in ref_pool.iterrows()]
+                ref_sel    = st.selectbox("Which trade?", ref_labels, key="tr_add_ref_sel")
+                ref_idx    = ref_labels.index(ref_sel)
+                ref_row    = ref_pool.iloc[ref_idx]
+
+            if ref_row is not None:
+                # For assignment/expiry: date = expiry from the original trade, fees already paid
+                _expiry_str = str(ref_row.get('expiry', ''))
+                _auto_date  = None
+                if _expiry_str:
+                    try:
+                        _auto_date = datetime.strptime(_expiry_str, '%Y-%m-%d').date()
+                    except ValueError:
+                        pass
+
+                if is_opt_close:
+                    # Buy to Close: still need date + close price + optional fees
+                    with st.form("tr_add_form", clear_on_submit=True):
+                        fe1, fe2, fe3 = st.columns(3)
+                        tr_date  = fe1.date_input("Date", value=datetime.today(), key="tr_add_date_f")
+                        tr_price = fe2.number_input("Close price ($/share as quoted)", min_value=0.0, step=0.01, value=0.0, key="tr_add_close_price_f")
+                        tr_fees  = fe3.number_input("Fees ($)", min_value=0.0, step=0.01, value=0.0, key="tr_add_fees_f")
+                        tr_notes = st.text_input("Notes (optional)", key="tr_add_notes_f").strip()
+                        submitted = st.form_submit_button("Log Trade", type="primary")
+                else:
+                    # Assigned or Expired: date auto-set to expiry, no fees, no price
+                    _date_label = f"Expiry date from original trade: **{_expiry_str}**" if _expiry_str else "Expiry date unknown"
+                    st.caption(_date_label)
+                    tr_date  = _auto_date or datetime.today().date()
+                    tr_price = 0.0
+                    tr_fees  = 0.0
+                    with st.form("tr_add_form", clear_on_submit=True):
+                        tr_notes  = st.text_input("Notes (optional)", key="tr_add_notes_f").strip()
+                        submitted = st.form_submit_button("Log Trade", type="primary")
+
+                if submitted:
+                    next_id = int(trades['id'].max() + 1) if not trades.empty and pd.notna(trades['id']).any() else 1
+                    new_row = pd.DataFrame([{
+                        'id':          next_id,
+                        'date':        str(tr_date),
+                        'ticker':      ref_row['ticker'],
+                        'strategy':    ref_row['strategy'],
+                        'event_type':  event_type,
+                        'qty':         float(ref_row['qty']),
+                        'strike':      float(ref_row['strike']) if pd.notna(ref_row.get('strike')) else np.nan,
+                        'expiry':      _expiry_str,
+                        'option_type': str(ref_row.get('option_type', '')),
+                        'price':       float(tr_price),
+                        'fees':        float(tr_fees),
+                        'notes':       tr_notes,
+                    }])
+                    save_trades(pd.concat([trades, new_row], ignore_index=True))
+                    cf = trade_cash_flow(new_row.iloc[0])
+                    cf_str = f"+${cf:,.2f}" if cf >= 0 else f"-${abs(cf):,.2f}"
+                    st.success(f"Logged: {event_type} — {str(ref_row['ticker']).upper()} ({cf_str})")
+                    st.rerun()
+
+        else:
+            # Standard form: Buy/Sell Stock, Sell Covered Call, Sell CSP, Dividend
+            # Build strategy→ticker lookup from existing trades
+            strat_ticker_map = {}
+            if not trades.empty:
+                for _, _r in trades.iterrows():
+                    _s = str(_r.get('strategy', '')).strip()
+                    _t = str(_r.get('ticker', '')).strip().upper()
+                    if _s and _t and _s not in strat_ticker_map:
+                        strat_ticker_map[_s] = _t
+
+            # Strategy picker OUTSIDE the form so ticker can react immediately
+            strat_options = ["(new strategy)"] + existing_strategies
+            strat_sel = st.selectbox("Strategy", strat_options, key="tr_add_strat_sel_f")
+
+            if strat_sel == "(new strategy)":
+                c_strat, c_ticker = st.columns([3, 2])
+                tr_strategy = c_strat.text_input("New strategy name", placeholder="e.g. AAPL Covered Call Wheel", key="tr_add_strat_new_f").strip()
+                tr_ticker   = c_ticker.text_input("Ticker", placeholder="AAPL", key="tr_add_ticker_f").strip().upper()
+            else:
+                tr_strategy    = strat_sel
+                implied_ticker = strat_ticker_map.get(strat_sel, "")
+                st.caption(f"Ticker: **{implied_ticker}**")
+                tr_ticker = implied_ticker
+
+            if event_type == "Sell Covered Call" and existing_strategies:
+                st.info(
+                    "Pick the **same strategy** as your stock/assignment trade so P&L rolls up correctly.",
+                    icon="💡"
+                )
+
+            with st.form("tr_add_form", clear_on_submit=True):
+                tr_date = st.date_input("Date", value=datetime.today(), key="tr_add_date_f")
+
+                if is_dividend:
+                    # Auto-compute shares held for this strategy/ticker from open positions
+                    _div_open = compute_open_stock_positions(
+                        trades[trades['strategy'] == tr_strategy] if tr_strategy and tr_strategy != "(new strategy)" else trades
+                    )
+                    _div_shares = _div_open.get(tr_ticker, {}).get('shares', 0) if tr_ticker else 0
+                    d1, d2 = st.columns(2)
+                    tr_div_per_share = d1.number_input(
+                        "Dividend per share ($)", min_value=0.0, step=0.001, value=0.0,
+                        format="%.3f", key="tr_add_div_ps_f"
+                    )
+                    if _div_shares > 0:
+                        _div_total = tr_div_per_share * _div_shares
+                        d2.metric("Total dividend", f"${_div_total:,.2f}",
+                                  delta=f"{int(_div_shares)} shares")
+                        tr_price = _div_total
+                    else:
+                        tr_price = d2.number_input(
+                            "Or enter total amount ($)", min_value=0.0, step=0.01,
+                            value=0.0, key="tr_add_div_total_f"
+                        )
+                        if tr_div_per_share > 0:
+                            tr_price = tr_div_per_share  # fallback
+                    tr_qty      = float(_div_shares) if _div_shares > 0 else 1.0
+                    tr_strike   = np.nan
+                    tr_expiry   = ""
+                    tr_opt_type = ""
+                    tr_acct     = ""
+                    tr_cap_res  = np.nan
+
+                elif is_opt_sell:
+                    # Option type is implied by event name — no selector needed
+                    tr_opt_type = "C" if event_type == "Sell Covered Call" else "P"
+                    nc1, nc2    = st.columns(2)
+                    tr_qty      = nc1.number_input("Contracts", min_value=1, step=1, value=1, key="tr_add_qty_f")
+                    tr_strike   = nc2.number_input("Strike ($)", min_value=0.01, step=0.5, value=100.0, key="tr_add_strike_f")
+                    pd1, pd2    = st.columns(2)
+                    tr_expiry   = pd1.text_input("Expiry (YYYY-MM-DD)", placeholder="2025-05-16", key="tr_add_expiry_f").strip()
+                    tr_price    = pd2.number_input("Premium ($/share as quoted)", min_value=0.0, step=0.01, value=0.0, key="tr_add_price_opt_f")
+
+                    if event_type == "Sell Cash-Secured Put":
+                        tr_acct    = st.radio("Account type", ["Cash", "Margin"], horizontal=True, key="tr_add_acct_f")
+                        _notional  = float(tr_qty) * tr_strike * 100
+                        tr_cap_res = _notional   # always use notional for benchmark comparison
+                        if tr_acct == "Cash":
+                            st.caption(f"Capital reserved: **${_notional:,.2f}** (strike × 100 × contracts)")
+                        else:
+                            st.caption(
+                                f"Benchmark will use notional **${_notional:,.2f}** (strike × 100 × contracts) "
+                                "as your economic exposure — no cash reservation needed on margin."
+                            )
+                    else:
+                        tr_acct    = ""
+                        tr_cap_res = np.nan
+
+                else:  # Buy Stock / Sell Stock
+                    sc1, sc2    = st.columns(2)
+                    tr_qty      = sc1.number_input("Shares", min_value=1, step=1, value=100, key="tr_add_qty_stk_f")
+                    tr_price    = sc2.number_input("Price per share ($)", min_value=0.01, step=0.01, value=100.0, key="tr_add_price_stk_f")
+                    tr_strike   = np.nan
+                    tr_expiry   = ""
+                    tr_opt_type = ""
+                    tr_acct     = ""
+                    tr_cap_res  = np.nan
+
+                fe1, fe2 = st.columns([2, 3])
+                tr_fees  = fe1.number_input("Fees / commission ($)", min_value=0.0, step=0.01, value=0.0, key="tr_add_fees_f")
+                tr_notes = fe2.text_input("Notes (optional)", key="tr_add_notes_f").strip()
+
+                submitted = st.form_submit_button("Log Trade", type="primary")
+
+            if submitted:
+                if not tr_ticker:
+                    st.error("Ticker is required — enter it alongside your new strategy name.")
+                elif not tr_strategy:
+                    st.error("Strategy name is required.")
+                else:
+                    next_id = int(trades['id'].max() + 1) if not trades.empty and pd.notna(trades['id']).any() else 1
+                    new_row = pd.DataFrame([{
+                        'id':               next_id,
+                        'date':             str(tr_date),
+                        'ticker':           tr_ticker,
+                        'strategy':         tr_strategy,
+                        'event_type':       event_type,
+                        'qty':              float(tr_qty),
+                        'strike':           float(tr_strike) if pd.notna(tr_strike) else np.nan,
+                        'expiry':           tr_expiry,
+                        'option_type':      tr_opt_type,
+                        'price':            float(tr_price),
+                        'fees':             float(tr_fees),
+                        'account_type':     tr_acct,
+                        'capital_reserved': float(tr_cap_res) if pd.notna(tr_cap_res) else np.nan,
+                        'notes':            tr_notes,
+                    }])
+                    save_trades(pd.concat([trades, new_row], ignore_index=True))
+                    cf = trade_cash_flow(new_row.iloc[0])
+                    cf_str = f"+${cf:,.2f}" if cf >= 0 else f"-${abs(cf):,.2f}"
+                    st.success(f"Logged: {event_type} — {tr_ticker} ({cf_str})")
+                    st.rerun()
+
+    # ------------------------------------------------------------------
+    # PERFORMANCE
+    # ------------------------------------------------------------------
+    with tr_perf:
+        if trades.empty:
+            st.info("No trades yet. Add some trades to see performance.")
+        else:
+            all_strategies = sorted(trades['strategy'].dropna().astype(str).unique().tolist())
+            perf_strat = st.selectbox(
+                "Strategy", ["All"] + all_strategies, key="perf_strat_sel"
+            )
+            perf_trades = trades if perf_strat == "All" else trades[trades['strategy'] == perf_strat]
+
+            trades_cf = perf_trades.copy()
+            trades_cf['cash_flow'] = trades_cf.apply(trade_cash_flow, axis=1)
+
+            # --- Open stock positions + live prices ---
+            open_positions = compute_open_stock_positions(perf_trades)
+            live_prices = {}
+            if open_positions:
+                live_prices = fetch_trade_live_prices(tuple(sorted(open_positions.keys())))
+
+            total_mkt_value  = 0.0
+            total_cost_basis = 0.0
+            for tkr, pos in open_positions.items():
+                px = live_prices.get(tkr)
+                if px:
+                    total_mkt_value  += px * pos['shares']
+                    total_cost_basis += pos['cost_basis']
+            total_unrealized = total_mkt_value - total_cost_basis
+            total_premium    = trades_cf[trades_cf['event_type'].isin(_OPTION_SELL_EVENTS)]['cash_flow'].sum()
+            total_realized   = trades_cf['cash_flow'].sum()
+            # Total P&L = net cash flows + current value of shares still held
+            total_pnl        = total_realized + total_mkt_value
+
+            # --- Top-line metrics ---
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Premium Collected", f"${total_premium:,.2f}")
+            m2.metric("Unrealized (Open Shares)", f"${total_unrealized:+,.2f}",
+                      delta=f"${total_mkt_value:,.2f} mkt value" if total_mkt_value else "no open positions")
+            m3.metric("Total P&L (vs Capital Deployed)", f"${total_pnl:,.2f}",
+                      delta=f"${total_cost_basis:,.2f} deployed" if total_cost_basis else None)
+
+            # --- Open positions table ---
+            if open_positions:
+                st.divider()
+                st.markdown("**Open Stock Positions**")
+                pos_rows = []
+                for tkr, pos in open_positions.items():
+                    px  = live_prices.get(tkr)
+                    avg = pos['cost_basis'] / pos['shares'] if pos['shares'] else 0
+                    mkt = px * pos['shares'] if px else None
+                    unr = (mkt - pos['cost_basis']) if mkt is not None else None
+                    pos_rows.append({
+                        "Ticker":        tkr,
+                        "Shares":        int(pos['shares']),
+                        "Avg Cost":      f"${avg:.2f}",
+                        "Current Price": f"${px:.2f}" if px else "—",
+                        "Mkt Value":     f"${mkt:,.2f}" if mkt is not None else "—",
+                        "Unrealized":    f"${unr:+,.2f}" if unr is not None else "—",
+                    })
+                st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+
+            # --- Benchmark comparison ---
+            # Cash account:   capital = notional from sell date (cash tied up immediately)
+            # Margin account: capital = assignment cost, clock starts on assignment date
+            #                 (no capital used until assigned)
+            st.divider()
+            st.markdown("**vs Benchmarks — same capital, same start date**")
+
+            sorted_trades = trades_cf.sort_values('date').dropna(subset=['date'])
+
+            # Separate cash vs margin sell trades
+            sell_trades = sorted_trades[sorted_trades['event_type'].isin(_OPTION_SELL_EVENTS)].copy()
+            assign_trades = sorted_trades[sorted_trades['event_type'].isin(_ASSIGN_EVENTS)].copy()
+
+            cash_sells   = sell_trades[sell_trades.get('account_type', pd.Series()).fillna('') == 'Cash'] if 'account_type' in sell_trades.columns else pd.DataFrame()
+            margin_sells = sell_trades[sell_trades.get('account_type', pd.Series()).fillna('') == 'Margin'] if 'account_type' in sell_trades.columns else pd.DataFrame()
+
+            # Build list of (date, capital) deployment events
+            deployments = []
+
+            # Cash: capital deployed on sell date = capital_reserved
+            for _, r in (cash_sells.iterrows() if not cash_sells.empty else []):
+                cap = float(r['capital_reserved']) if pd.notna(r.get('capital_reserved')) else 0.0
+                if cap > 0:
+                    deployments.append({'date': pd.to_datetime(r['date']), 'capital': cap})
+
+            # Margin: capital deployed on assignment date = strike × 100 × qty
+            for _, r in (assign_trades.iterrows() if not assign_trades.empty else []):
+                strike_r = float(r['strike']) if pd.notna(r.get('strike')) else 0.0
+                qty_r    = float(r['qty'])     if pd.notna(r.get('qty'))    else 0.0
+                cap      = strike_r * 100 * qty_r
+                if cap > 0:
+                    deployments.append({'date': pd.to_datetime(r['date']), 'capital': cap})
+
+            # Fallback: if nothing tagged yet, use total cost basis from assignment date
+            if not deployments and total_cost_basis > 0 and not assign_trades.empty:
+                deployments.append({
+                    'date':    pd.to_datetime(assign_trades.iloc[0]['date']),
+                    'capital': total_cost_basis,
+                })
+
+            if deployments:
+                dep_df     = pd.DataFrame(deployments).sort_values('date')
+                first_date = dep_df['date'].iloc[0]
+                capital    = float(dep_df['capital'].sum())
+                cap_label  = (
+                    f"notional from sell date (cash)" if not cash_sells.empty and margin_sells.empty
+                    else f"assignment cost from assignment date (margin)"
+                    if cash_sells.empty and not margin_sells.empty
+                    else "mixed cash + margin deployments"
+                )
+            else:
+                first_date = None
+                capital    = 0.0
+                cap_label  = ""
+
+            if first_date and capital > 0:
+                first_date_str = first_date.strftime('%Y-%m-%d')
+
+                with st.spinner("Fetching benchmark data..."):
+                    bench = fetch_benchmark_history(("VTI", "QQQ", "BRK-B", "VXUS", "FREL"), first_date_str)
+
+                if bench:
+                    # --- Comparison table ---
+                    bench_rows = []
+                    for tkr, series in bench.items():
+                        series = series.dropna()
+                        if len(series) < 2:
+                            continue
+                        s0       = float(series.iloc[0])
+                        s1       = float(series.iloc[-1])
+                        ret_pct  = (s1 - s0) / s0
+                        bench_val = capital * (1 + ret_pct)   # what capital would be worth today
+                        bench_gain = bench_val - capital
+                        bench_rows.append({
+                            "ETF":                tkr,
+                            "Capital Deployed":   f"${capital:,.2f}",
+                            "ETF Value Today":    f"${bench_val:,.2f}",
+                            "ETF Gain":           f"${bench_gain:+,.2f}",
+                            "ETF Return":         f"{ret_pct*100:+.1f}%",
+                            "Your Total P&L":     f"${total_pnl:,.2f}",
+                            "You vs ETF":         f"${total_pnl - bench_gain:+,.2f}",
+                        })
+
+                    if bench_rows:
+                        bench_df = pd.DataFrame(bench_rows)
+                        st.dataframe(bench_df, use_container_width=True, hide_index=True)
+
+                    # --- Equity curve: your running P&L vs benchmark growth ---
+                    st.markdown("**Equity curve — your strategy vs benchmarks**")
+
+                    # Build daily running P&L series from trades
+                    cf_daily = (
+                        sorted_trades
+                        .assign(date=lambda d: pd.to_datetime(d['date']).dt.normalize())
+                        .groupby('date')['cash_flow']
+                        .sum()
+                        .sort_index()
+                    )
+                    # Running realized cash (negative = money out, positive = money in)
+                    # We flip sign for "portfolio value" view: start at capital deployed, track gains
+                    running_cf = cf_daily.cumsum()
+
+                    # Benchmark: grow capital at ETF daily returns
+                    plot_data = {"Your Strategy": running_cf}
+                    for tkr, series in bench.items():
+                        series = series.dropna()
+                        if len(series) < 2:
+                            continue
+                        # Normalize to same capital basis: gain/loss in dollars
+                        norm = ((series / series.iloc[0]) - 1) * capital
+                        norm.index = pd.to_datetime(norm.index).normalize()
+                        plot_data[tkr] = norm
+
+                    plot_df = pd.DataFrame(plot_data).sort_index()
+                    plot_df.index.name = "Date"
+                    # Forward-fill benchmark gaps (weekends/holidays)
+                    plot_df = plot_df.ffill()
+                    st.line_chart(plot_df, use_container_width=True, height=250)
+
+                    st.caption(
+                        f"Capital deployed: **${capital:,.2f}** ({cap_label}). "
+                        f"Start date: **{first_date_str}**. "
+                        f"Your total P&L = realized cash flows (${total_realized:,.2f}) "
+                        f"+ market value of open shares (${total_mkt_value:,.2f}). "
+                        "Live prices refresh every 2 min."
+                    )
+                else:
+                    st.warning("Could not fetch benchmark data. Check your internet connection.")
+            elif first_date and capital == 0:
+                st.info("Benchmark comparison shows once capital is deployed (sell a put or get assigned).")
+            else:
+                st.info("Add trades to see benchmark comparison.")
+
+with page_tab5:
+    _trades_tab()
