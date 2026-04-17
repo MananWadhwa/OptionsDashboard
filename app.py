@@ -1874,7 +1874,7 @@ with page_tab4:
                 'Symbol', 'Sum Qty', 'Cost Basis', 'Avg Cost',
                 'Curr Price', 'Curr Value', 'Gain/Loss', '% G/L', 'Alloc%'
             ])
-            df = df.sort_values('Curr Value', key=lambda x: x.abs().fillna(0), ascending=False)
+            df = df.sort_values('Curr Value', key=lambda x: pd.to_numeric(x, errors='coerce').abs().fillna(0), ascending=False)
 
             def fmt_dollar(v):
                 if v is None or (isinstance(v, float) and pd.isna(v)):
