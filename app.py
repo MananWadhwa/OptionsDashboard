@@ -2525,13 +2525,27 @@ def _get_rotation_state(strat_trades):
       active_ticker – ticker for the active leg, or None
       next_leg      – int leg number to use for the next Rotate Into
       all_closed    – True when every leg that was opened has also been closed
+
+    Strategies that began with Buy Stock / Assigned (before Rotate Into existed)
+    are treated as having an implicit open leg 1 until a Rotate Out is logged.
     """
     if strat_trades.empty:
         return None, None, 1, True
     rot_in  = strat_trades[strat_trades['event_type'] == 'Rotate Into']
     rot_out = strat_trades[strat_trades['event_type'] == 'Rotate Out']
+
+    # If no Rotate Into exists, check whether shares were acquired via Buy Stock
+    # or Assignment — treat that as an implicit open leg 1.
     if rot_in.empty:
-        return None, None, 1, True
+        _entry_events = {"Buy Stock", "Assigned (Put)", "Assigned (Call)"}
+        has_entry = strat_trades['event_type'].isin(_entry_events).any()
+        if not has_entry or not rot_out.empty:
+            return None, None, 1, True
+        # Implicit leg 1 is open — find the ticker from the entry trade
+        entry_row = strat_trades[strat_trades['event_type'].isin(_entry_events)].iloc[0]
+        active_ticker = str(entry_row['ticker']).upper()
+        return 1, active_ticker, 2, False
+
     legs_in  = set(rot_in['leg'].dropna().astype(int).tolist())
     legs_out = set(rot_out['leg'].dropna().astype(int).tolist())
     open_legs = legs_in - legs_out
