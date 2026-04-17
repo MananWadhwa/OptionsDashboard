@@ -254,7 +254,7 @@ def get_latest_price(ticker_obj):
         return float(hist['Close'].iloc[-1]), hist.index[-1]
     return 0.0, pd.Timestamp.now(tz="UTC")
 
-def _yf_fetch_with_retry(fn, retries=3, base_delay=5):
+def _yf_fetch_with_retry(fn, retries=4, base_delay=8):
     """Calls fn(), retrying on rate-limit errors with exponential backoff."""
     for attempt in range(retries):
         try:
@@ -312,8 +312,12 @@ def fetch_option_data(occ_list):
             if pd.isna(hist_vol) or hist_vol < 0.05:
                 hist_vol = 0.25
 
+            time.sleep(0.5)  # brief pause between calls within the same ticker
+
             # Fetch each unique expiration once per ticker
-            available_exps = list(underlying_ticker.options)
+            available_exps = _yf_fetch_with_retry(
+                lambda t=underlying_ticker: list(t.options)
+            )
             chains = {}
             for occ, (_, expiration, _, _) in contracts:
                 if expiration not in chains:
@@ -323,6 +327,7 @@ def fetch_option_data(occ_list):
                         chains[expiration] = None
                         continue
                     try:
+                        time.sleep(0.5)
                         chains[expiration] = _yf_fetch_with_retry(
                             lambda t=underlying_ticker, e=expiration: t.option_chain(e)
                         )
