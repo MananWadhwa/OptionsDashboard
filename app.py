@@ -2708,6 +2708,18 @@ def _trades_tab():
                                 st.success("Trade updated.")
                                 st.rerun()
 
+            # Total P&L header
+            all_cf = trades.apply(trade_cash_flow, axis=1).sum()
+            all_cf_color = "#22c55e" if all_cf >= 0 else "#f87171"
+            all_cf_str   = f"+${all_cf:,.2f}" if all_cf >= 0 else f"-${abs(all_cf):,.2f}"
+            st.markdown(
+                f'<div style="display:flex;align-items:baseline;gap:10px;padding:4px 0 12px;">'
+                f'<span style="color:#94a3b8;font-size:0.85em;">Total P&L</span>'
+                f'<span style="color:{all_cf_color};font-size:1.4em;font-weight:700;">{all_cf_str}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
             # Group by strategy
             strategies = sorted(trades['strategy'].dropna().astype(str).unique().tolist())
             for strat in strategies:
