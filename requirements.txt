@@ -4,3 +4,4 @@ yfinance
 scipy
 numpy
 pdfplumber
+curl_cffi

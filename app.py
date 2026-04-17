@@ -12,6 +12,19 @@ import urllib.request
 import json
 import time
 
+try:
+    from curl_cffi import requests as curl_requests
+    _YF_SESSION = curl_requests.Session(impersonate="chrome")
+except ImportError:
+    _YF_SESSION = None
+
+def _yf_ticker(symbol):
+    """Create a yf.Ticker, using a curl_cffi session when available to bypass
+    Yahoo Finance bot-detection on shared IPs (e.g. Streamlit Cloud)."""
+    if _YF_SESSION is not None:
+        return yf.Ticker(symbol, session=_YF_SESSION)
+    return yf.Ticker(symbol)
+
 st.set_page_config(page_title="Options Tracker", layout="wide")
 
 # PWA: manifest + service worker registration + iOS meta tags
@@ -282,9 +295,7 @@ def fetch_option_data(occ_list):
         if i > 0:
             time.sleep(inter_ticker_delay)
         try:
-            underlying_ticker = _yf_fetch_with_retry(
-                lambda sym=ticker_sym: yf.Ticker(yf_ticker(sym))
-            )
+            underlying_ticker = _yf_ticker(yf_ticker(ticker_sym))
             
             def fetch_spot_and_vol(t):
                 hist = t.history(period="1y", prepost=True)['Close']
@@ -1225,7 +1236,7 @@ def fetch_watchlist_prices(occ_list):
             continue
         ticker, expiration, opt_type, strike = parsed
         try:
-            underlying_ticker = yf.Ticker(ticker)
+            underlying_ticker = _yf_ticker(ticker)
             spot, stock_date = get_latest_price(underlying_ticker)
             chain = underlying_ticker.option_chain(expiration)
             options = chain.calls if opt_type == 'C' else chain.puts
@@ -1359,7 +1370,7 @@ def fetch_trade_live_prices(tickers_tuple):
     result = {}
     for ticker in tickers_tuple:
         try:
-            t = yf.Ticker(ticker)
+            t = _yf_ticker(ticker)
             price, _ = get_latest_price(t)
             result[ticker] = price
         except Exception:
@@ -1519,7 +1530,7 @@ def fetch_stock_prices(tickers):
     results = {}
     for ticker in tickers:
         try:
-            t = yf.Ticker(ticker)
+            t = _yf_ticker(ticker)
             hist = t.history(period="1y", prepost=True)
             if hist.empty:
                 raise ValueError("No data returned")
@@ -1716,7 +1727,7 @@ def fetch_summary_equity_prices(tickers_tuple):
     result = {}
     for ticker in tickers_tuple:
         try:
-            t = yf.Ticker(ticker)
+            t = _yf_ticker(ticker)
             price, _ = get_latest_price(t)
             result[ticker] = price
         except Exception:
@@ -2155,7 +2166,7 @@ def fetch_sentiment_prices(tickers):
     results = {}
     for ticker_id, ticker_info in tickers.items():
         try:
-            ticker = yf.Ticker(ticker_id)
+            ticker = _yf_ticker(ticker_id)
             hist = ticker.history(period="5d", prepost=True)
             price, _ = get_latest_price(ticker)
             prev  = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else float(hist['Close'].iloc[-1])
@@ -2177,8 +2188,8 @@ def fetch_sentiment_prices(tickers):
 def fetch_ibit_approx():
     """Estimate current IBIT price using BTC-USD ratio (useful when market is closed)."""
     try:
-        ibit = yf.Ticker("IBIT")
-        btc = yf.Ticker("BTC-USD")
+        ibit = _yf_ticker("IBIT")
+        btc = _yf_ticker("BTC-USD")
 
         ibit_hist = ibit.history(period="5d", interval="1d")
         btc_hist = btc.history(period="5d", interval="1d")
