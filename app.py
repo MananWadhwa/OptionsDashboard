@@ -652,9 +652,38 @@ st.markdown(
     'padding:4px 0 10px;letter-spacing:0.01em;">Options Tracker</div>',
     unsafe_allow_html=True
 )
-page_tab1, page_tab2, page_tab3, page_tab4, page_tab5 = st.tabs(["Portfolio", "Watchlist", "Sentiment", "Summary", "Trades"])
+_TAB_NAMES = ["Portfolio", "Watchlist", "Sentiment", "Summary", "Trades"]
+if "active_tab" not in st.session_state:
+    st.session_state.active_tab = "Portfolio"
 
-with page_tab1:
+st.markdown("""
+<style>
+div[role="radiogroup"] { gap: 0; }
+div[role="radiogroup"] > label {
+    padding: 8px 18px;
+    border-bottom: 2px solid transparent;
+    font-size: 0.9em;
+    color: #94a3b8;
+    cursor: pointer;
+    white-space: nowrap;
+}
+div[role="radiogroup"] > label:has(input:checked) {
+    border-bottom: 2px solid #ff4b4b;
+    color: #f1f5f9;
+    font-weight: 600;
+}
+div[role="radiogroup"] > label:hover { color: #e2e8f0; }
+div[role="radiogroup"] > label > div:first-child { display: none; }
+</style>
+""", unsafe_allow_html=True)
+
+_active_tab = st.radio("nav", _TAB_NAMES,
+    index=_TAB_NAMES.index(st.session_state.active_tab),
+    horizontal=True, label_visibility="collapsed",
+    key="active_tab")
+st.divider()
+
+if _active_tab == "Portfolio":
     # Load Positions from multiple files
     try:
         position_files = glob.glob("positions/positions_*.csv")
@@ -1734,7 +1763,7 @@ def fetch_summary_equity_prices(tickers_tuple):
             result[ticker] = None
     return result
 
-with page_tab4:
+if _active_tab == "Summary":
     st.markdown('<div style="font-size:1em;font-weight:700;color:#e2e8f0;padding:2px 0 10px;">Portfolio Summary</div>', unsafe_allow_html=True)
 
     try:
@@ -1938,7 +1967,7 @@ with page_tab4:
             with st.expander(f"Options ({len(opt_rows)})", expanded=False):
                 st.dataframe(_make_holdings_df(opt_rows), use_container_width=True, hide_index=True)
 
-with page_tab2:
+if _active_tab == "Watchlist":
     watchlist = load_watchlist()
 
     # Live mode toggle (off by default, resets when page is closed)
@@ -2344,7 +2373,7 @@ def gauge_html(score, label, title, sub_rows):
   <div>{sub_html}</div>
 </div>"""
 
-with page_tab3:
+if _active_tab == "Sentiment":
     st.markdown('<div style="font-size:1em;font-weight:700;color:#e2e8f0;padding:2px 0 8px;">Market Sentiment</div>', unsafe_allow_html=True)
 
     # Live mode toggle for Sentiment
@@ -3349,5 +3378,5 @@ def _trades_tab():
             else:
                 st.info("Add trades to see benchmark comparison.")
 
-with page_tab5:
+if _active_tab == "Trades":
     _trades_tab()
