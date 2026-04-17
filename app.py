@@ -2867,9 +2867,9 @@ def _trades_tab():
                 with st.form("tr_add_form_rot", clear_on_submit=True):
                     rc1, rc2 = st.columns(2)
                     tr_rot_date = rc1.date_input("Date", value=datetime.today(), key="tr_rot_date_f")
-                    tr_rot_qty  = rc2.number_input("Shares", min_value=1, step=1, value=100, key="tr_rot_qty_f")
+                    tr_rot_qty  = rc2.number_input("Shares", min_value=0.001, step=1.0, value=100.0, format="%.3f", key="tr_rot_qty_f")
                     rp1, rp2   = st.columns(2)
-                    tr_rot_price = rp1.number_input("Price per share ($)", min_value=0.01, step=0.01, value=100.0, key="tr_rot_price_f")
+                    tr_rot_price = rp1.number_input("Price per share ($)", min_value=0.001, step=0.001, value=100.0, format="%.3f", key="tr_rot_price_f")
                     tr_rot_fees  = rp2.number_input("Fees ($)", min_value=0.0, step=0.01, value=0.0, key="tr_rot_fees_f")
                     tr_rot_notes = st.text_input("Notes (optional)", key="tr_rot_notes_f").strip()
                     rot_submitted = st.form_submit_button("Log Trade", type="primary")
