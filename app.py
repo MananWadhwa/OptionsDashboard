@@ -254,7 +254,7 @@ def get_latest_price(ticker_obj):
         return float(hist['Close'].iloc[-1]), hist.index[-1]
     return 0.0, pd.Timestamp.now(tz="UTC")
 
-def _yf_fetch_with_retry(fn, retries=4, base_delay=8):
+def _yf_fetch_with_retry(fn, retries=3, base_delay=3):
     """Calls fn(), retrying on rate-limit errors with exponential backoff."""
     for attempt in range(retries):
         try:
@@ -287,9 +287,7 @@ def fetch_option_data(occ_list):
         if parsed:
             by_ticker[parsed[0]].append((occ, parsed))
 
-    # Increase delay between tickers on hosted environments (Streamlit Cloud
-    # shares IPs, so Yahoo Finance rate-limits more aggressively there).
-    inter_ticker_delay = 1.5
+    inter_ticker_delay = 0.3
 
     for i, (ticker_sym, contracts) in enumerate(by_ticker.items()):
         if i > 0:
@@ -312,8 +310,6 @@ def fetch_option_data(occ_list):
             if pd.isna(hist_vol) or hist_vol < 0.05:
                 hist_vol = 0.25
 
-            time.sleep(0.5)  # brief pause between calls within the same ticker
-
             # Fetch each unique expiration once per ticker
             available_exps = _yf_fetch_with_retry(
                 lambda t=underlying_ticker: list(t.options)
@@ -327,7 +323,6 @@ def fetch_option_data(occ_list):
                         chains[expiration] = None
                         continue
                     try:
-                        time.sleep(0.5)
                         chains[expiration] = _yf_fetch_with_retry(
                             lambda t=underlying_ticker, e=expiration: t.option_chain(e)
                         )
