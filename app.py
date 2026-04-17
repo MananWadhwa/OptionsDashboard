@@ -3217,7 +3217,8 @@ def _trades_tab():
             # Rules for capital deployment:
             #   Cash CSP:     capital = capital_reserved at SELL date (cash locked up then)
             #   Margin CSP:   capital = strike×100×qty at ASSIGNMENT date (no cash until assigned)
-            #   Buy Stock / Rotate Into: capital = qty×price at BUY date
+            #   Buy Stock: capital = qty×price at BUY date
+            #   Rotate Into: SKIPPED if strategy has a Rotate Out (same capital recycled)
             # Assignments from cash CSPs are SKIPPED — same cash already counted at sell date.
             # Each tranche is benchmarked from its own deployment date (not all from earliest).
             st.divider()
@@ -3228,6 +3229,15 @@ def _trades_tab():
             sell_trades   = sorted_trades[sorted_trades['event_type'].isin(_OPTION_SELL_EVENTS)].copy()
             assign_trades = sorted_trades[sorted_trades['event_type'].isin(_ASSIGN_EVENTS)].copy()
             buy_trades    = sorted_trades[sorted_trades['event_type'].isin({"Buy Stock", "Rotate Into"})].copy()
+            # Strategies with a Rotate Out reuse existing capital — don't count
+            # their Rotate Into legs as fresh capital deployments.
+            rotation_strats = set(
+                sorted_trades[sorted_trades['event_type'] == 'Rotate Out']['strategy'].tolist()
+            )
+            buy_trades = buy_trades[
+                ~((buy_trades['event_type'] == 'Rotate Into') &
+                  (buy_trades['strategy'].isin(rotation_strats)))
+            ]
 
             cash_sells    = sell_trades[sell_trades['account_type'].fillna('') == 'Cash'] if 'account_type' in sell_trades.columns else pd.DataFrame()
             margin_sells  = sell_trades[sell_trades['account_type'].fillna('') == 'Margin'] if 'account_type' in sell_trades.columns else pd.DataFrame()
