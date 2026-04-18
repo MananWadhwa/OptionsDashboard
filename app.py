@@ -1406,6 +1406,97 @@ def fetch_trade_live_prices(tickers_tuple):
             result[ticker] = None
     return result
 
+def strategy_premiums(strat_trades_df):
+    """Total options premiums collected (net of closing costs) for a strategy."""
+    pnl = 0.0
+    for _, row in strat_trades_df.iterrows():
+        et    = str(row.get('event_type', ''))
+        qty   = float(row.get('qty',   0) or 0)
+        price = float(row.get('price', 0) or 0)
+        fees  = float(row.get('fees',  0) or 0)
+        if et in _OPTION_SELL_EVENTS:
+            pnl += qty * 100 * price - fees
+        elif et in _OPTION_CLOSE_EVENTS:
+            pnl -= qty * 100 * price + fees
+        elif et == "Expired Worthless":
+            pnl -= fees
+    return pnl
+
+
+def strategy_pnl(strat_trades_df, live_prices=None):
+    """
+    True P&L for a strategy.
+    Includes: options premiums, dividends, realized stock gain/loss,
+              and unrealized gain/loss on open positions (if live_prices provided).
+    Excludes: raw capital deployed (Buy Stock / Rotate Into cost).
+    """
+    pnl = 0.0
+    positions = {}  # ticker -> {'shares': float, 'cost_basis': float}
+
+    for _, row in strat_trades_df.sort_values('date').iterrows():
+        et     = str(row.get('event_type', ''))
+        ticker = str(row.get('ticker', '')).upper()
+        qty    = float(row.get('qty',   0) or 0)
+        price  = float(row.get('price', 0) or 0)
+        fees   = float(row.get('fees',  0) or 0)
+        strike_raw = row.get('strike')
+        strike = float(strike_raw) if pd.notna(strike_raw) and str(strike_raw) not in ('', 'nan') else 0.0
+        pos = positions.setdefault(ticker, {'shares': 0.0, 'cost_basis': 0.0})
+
+        if et in ("Buy Stock", "Rotate Into"):
+            pos['shares']     += qty
+            pos['cost_basis'] += qty * price + fees
+
+        elif et in ("Sell Stock", "Rotate Out"):
+            if pos['shares'] > 0:
+                avg = pos['cost_basis'] / pos['shares']
+                sold = min(qty, pos['shares'])
+                realized = sold * price - fees - avg * sold
+                pnl += realized
+                pos['cost_basis'] -= avg * sold
+                pos['shares']     = max(0.0, pos['shares'] - sold)
+
+        elif et == "Assigned (Put)":
+            shares_added = qty * 100
+            pos['shares']     += shares_added
+            pos['cost_basis'] += shares_added * strike + fees
+
+        elif et == "Assigned (Call)":
+            if pos['shares'] > 0:
+                avg = pos['cost_basis'] / pos['shares']
+                sold = min(qty * 100, pos['shares'])
+                realized = sold * strike - fees - avg * sold
+                pnl += realized
+                pos['cost_basis'] -= avg * sold
+                pos['shares']     = max(0.0, pos['shares'] - sold)
+
+        elif et == "Dividend (DRIP)":
+            pos['shares'] += qty
+            # DRIP shares are dividends reinvested — zero cost basis
+
+        elif et == "Dividend":
+            pnl += price - fees
+
+        elif et in _OPTION_SELL_EVENTS:
+            pnl += qty * 100 * price - fees
+
+        elif et in _OPTION_CLOSE_EVENTS:
+            pnl -= qty * 100 * price + fees
+
+        elif et == "Expired Worthless":
+            pnl -= fees
+
+    # Add unrealized P&L for any still-open positions
+    if live_prices:
+        for ticker, pos in positions.items():
+            if pos['shares'] > 0:
+                curr = live_prices.get(ticker)
+                if curr:
+                    pnl += pos['shares'] * curr - pos['cost_basis']
+
+    return pnl
+
+
 def compute_open_stock_positions(trades_df):
     """
     Walk trades chronologically and return open share positions.
@@ -1449,8 +1540,7 @@ def compute_open_stock_positions(trades_df):
             pos['shares'] = max(0.0, pos['shares'] - qty * 100)
 
         elif et == "Dividend (DRIP)":
-            pos['cost_basis'] += qty * price  # shares acquired via reinvestment
-            pos['shares']     += qty
+            pos['shares'] += qty  # zero cost basis — dividend reinvestment
 
         elif et == "Rotate Into":
             pos['cost_basis'] += qty * price
@@ -2708,14 +2798,30 @@ def _trades_tab():
                                 st.success("Trade updated.")
                                 st.rerun()
 
-            # Total P&L header
-            all_cf = trades.apply(trade_cash_flow, axis=1).sum()
-            all_cf_color = "#22c55e" if all_cf >= 0 else "#f87171"
-            all_cf_str   = f"+${all_cf:,.2f}" if all_cf >= 0 else f"-${abs(all_cf):,.2f}"
+            # Fetch live prices for all open stock positions across all strategies
+            _journal_open = compute_open_stock_positions(trades)
+            _journal_tickers = tuple(sorted(_journal_open.keys()))
+            _journal_prices = fetch_trade_live_prices(_journal_tickers) if _journal_tickers else {}
+
+            _total_premiums  = strategy_premiums(trades)
+            _total_pnl_with  = strategy_pnl(trades, _journal_prices)
+            _total_pnl_wo    = _total_pnl_with - _total_premiums
+
+            def _metric_html(label, value):
+                color = "#22c55e" if value >= 0 else "#f87171"
+                val_str = f"+${value:,.2f}" if value >= 0 else f"-${abs(value):,.2f}"
+                return (
+                    f'<div style="display:flex;flex-direction:column;gap:2px;">'
+                    f'<span style="color:#64748b;font-size:0.72em;text-transform:uppercase;letter-spacing:0.05em;">{label}</span>'
+                    f'<span style="color:{color};font-size:1.1em;font-weight:700;">{val_str}</span>'
+                    f'</div>'
+                )
+
             st.markdown(
-                f'<div style="display:flex;align-items:baseline;gap:10px;padding:4px 0 12px;">'
-                f'<span style="color:#94a3b8;font-size:0.85em;">Total P&L</span>'
-                f'<span style="color:{all_cf_color};font-size:1.4em;font-weight:700;">{all_cf_str}</span>'
+                f'<div style="display:flex;gap:32px;padding:4px 0 14px;border-bottom:1px solid #1e2a3f;margin-bottom:12px;">'
+                f'{_metric_html("Premiums Collected", _total_premiums)}'
+                f'{_metric_html("P&L with Premiums", _total_pnl_with)}'
+                f'{_metric_html("P&L without Premiums", _total_pnl_wo)}'
                 f'</div>',
                 unsafe_allow_html=True
             )
@@ -2725,10 +2831,10 @@ def _trades_tab():
             for strat in strategies:
                 strat_trades = trades[trades['strategy'] == strat].copy()
                 strat_trades['_cf'] = strat_trades.apply(trade_cash_flow, axis=1)
-                strat_cf     = strat_trades['_cf'].sum()
                 n_trades     = len(strat_trades)
-                cf_color     = "#22c55e" if strat_cf >= 0 else "#f87171"
-                cf_str       = f"+${strat_cf:,.2f}" if strat_cf >= 0 else f"-${abs(strat_cf):,.2f}"
+                strat_pnl    = strategy_pnl(strat_trades, _journal_prices)
+                cf_color     = "#22c55e" if strat_pnl >= 0 else "#f87171"
+                cf_str       = f"+${strat_pnl:,.2f}" if strat_pnl >= 0 else f"-${abs(strat_pnl):,.2f}"
                 is_rotation  = strat_trades['event_type'].isin(_ROTATION_EVENTS).any()
 
                 if is_rotation:
@@ -3192,18 +3298,15 @@ def _trades_tab():
                     total_mkt_value  += px * pos['shares']
                     total_cost_basis += pos['cost_basis']
             total_unrealized = total_mkt_value - total_cost_basis
-            total_premium    = trades_cf[trades_cf['event_type'].isin(_OPTION_SELL_EVENTS)]['cash_flow'].sum()
-            total_realized   = trades_cf['cash_flow'].sum()
-            # Total P&L = net cash flows + current value of shares still held
-            total_pnl        = total_realized + total_mkt_value
+            perf_premiums = strategy_premiums(perf_trades)
+            perf_pnl_with = strategy_pnl(perf_trades, live_prices)
+            perf_pnl_wo   = perf_pnl_with - perf_premiums
 
             # --- Top-line metrics ---
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Premium Collected", f"${total_premium:,.2f}")
-            m2.metric("Unrealized (Open Shares)", f"${total_unrealized:+,.2f}",
-                      delta=f"${total_mkt_value:,.2f} mkt value" if total_mkt_value else "no open positions")
-            m3.metric("Total P&L (vs Capital Deployed)", f"${total_pnl:,.2f}",
-                      delta=f"${total_cost_basis:,.2f} deployed" if total_cost_basis else None)
+            m1.metric("Premiums Collected", f"${perf_premiums:,.2f}")
+            m2.metric("P&L with Premiums",  f"${perf_pnl_with:+,.2f}")
+            m3.metric("P&L without Premiums", f"${perf_pnl_wo:+,.2f}")
 
             # --- Open positions table ---
             if open_positions:
@@ -3360,8 +3463,8 @@ def _trades_tab():
                             "ETF Value Today":  f"${bench_val:,.2f}",
                             "ETF Gain":         f"${bench_gain:+,.2f}",
                             "ETF Return":       f"{ret_pct*100:+.1f}%",
-                            "Your Total P&L":   f"${total_pnl:,.2f}",
-                            "You vs ETF":       f"${total_pnl - bench_gain:+,.2f}",
+                            "Your Total P&L":   f"${perf_pnl_with:,.2f}",
+                            "You vs ETF":       f"${perf_pnl_with - bench_gain:+,.2f}",
                         })
 
                     if bench_rows:
@@ -3403,8 +3506,7 @@ def _trades_tab():
                     st.caption(
                         f"Capital deployed: **${capital:,.2f}** across {len(dep_df)} tranche{'s' if len(dep_df)>1 else ''} "
                         f"(earliest: {first_date_str}). "
-                        f"Your total P&L = realized cash flows (${total_realized:,.2f}) "
-                        f"+ market value of open shares (${total_mkt_value:,.2f}). "
+                        f"Your total P&L (with premiums): ${perf_pnl_with:,.2f}. "
                         "Live prices refresh every 2 min. Benchmark uses per-tranche returns."
                     )
                 else:
