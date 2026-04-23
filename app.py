@@ -161,7 +161,7 @@ def implied_volatility(target_price, S, K, T, r, q, option_type):
 # Simple cache for 1m history to avoid redundant API calls per ticker
 _hist_1m_cache = {}
 
-def approximate_realtime_option_price(ticker_obj, ticker_sym, actual_stock_price, strike, last_price, trade_time, exp_date_str, opt_type):
+def approximate_realtime_option_price(ticker_obj, ticker_sym, actual_stock_price, strike, last_price, trade_time, exp_date_str, opt_type, q=0.0):
     try:
         if ticker_sym not in _hist_1m_cache:
             hist = ticker_obj.history(period="5d", interval="1m")
@@ -188,11 +188,6 @@ def approximate_realtime_option_price(ticker_obj, ticker_sym, actual_stock_price
         T_current = max(0.001, (exp_date - actual_stock_timestamp).total_seconds() / (365.0 * 24 * 3600))
 
         r = 0.045
-        try:
-            div_yield = ticker_obj.info.get('dividendYield', 0.0) or 0.0
-            q = div_yield / 100  # yfinance returns dividendYield as a percentage (e.g. 0.98 for 0.98%)
-        except:
-            q = 0.0
 
         # Solve IV from last traded price using B-S (always monotone — no spurious roots)
         true_iv = implied_volatility(last_price, stock_price_at_trade, strike, T_trade, r, q, opt_type)
@@ -244,8 +239,11 @@ def format_occ_html(plain_option):
     )
 
 # --- DATA FETCHING ---
-def get_latest_price(ticker_obj):
-    """Fetches the most up-to-date spot price and timestamp, including pre/post market."""
+@st.cache_data(ttl=60)
+def get_latest_price(symbol: str):
+    """Fetches the most up-to-date spot price and timestamp, including pre/post market.
+    Cached for 60 s to prevent duplicate YF requests across tabs and functions."""
+    ticker_obj = _yf_ticker(symbol)
     hist = ticker_obj.history(period="5d", interval="1m", prepost=True)
     if not hist.empty:
         return float(hist['Close'].iloc[-1]), hist.index[-1]
@@ -253,6 +251,16 @@ def get_latest_price(ticker_obj):
     if not hist.empty:
         return float(hist['Close'].iloc[-1]), hist.index[-1]
     return 0.0, pd.Timestamp.now(tz="UTC")
+
+@st.cache_data(ttl=3600)
+def _get_div_yield(symbol: str) -> float:
+    """Returns dividend yield as a decimal (e.g. 0.012 for 1.2%). Cached 1 hour."""
+    try:
+        t = _yf_ticker(symbol)
+        dv = t.info.get('dividendYield', 0.0) or 0.0
+        return dv / 100
+    except Exception:
+        return 0.0
 
 def _yf_fetch_with_retry(fn, retries=3, base_delay=3):
     """Calls fn(), retrying on rate-limit errors with exponential backoff."""
@@ -293,18 +301,20 @@ def fetch_option_data(occ_list):
         if i > 0:
             time.sleep(inter_ticker_delay)
         try:
-            underlying_ticker = _yf_ticker(yf_ticker(ticker_sym))
-            
-            def fetch_spot_and_vol(t):
-                hist = t.history(period="1y", prepost=True)['Close']
+            yf_sym = yf_ticker(ticker_sym)
+            underlying_ticker = _yf_ticker(yf_sym)
+
+            def fetch_spot_and_vol(t, sym=yf_sym):
+                hist = t.history(period="6mo", interval="1d")['Close']
                 if hist.empty:
                     raise Exception("No price history")
-                spot, stock_date = get_latest_price(t)
+                spot, stock_date = get_latest_price(sym)  # cached 60 s
                 returns = np.log(hist / hist.shift(1))
                 vol = float(returns.std() * np.sqrt(252))
-                return spot, vol, stock_date
-                
-            spot_price, hist_vol, stock_date = _yf_fetch_with_retry(
+                q = _get_div_yield(sym)  # cached 1 h
+                return spot, vol, stock_date, q
+
+            spot_price, hist_vol, stock_date, div_q = _yf_fetch_with_retry(
                 lambda t=underlying_ticker: fetch_spot_and_vol(t)
             )
             if pd.isna(hist_vol) or hist_vol < 0.05:
@@ -373,7 +383,7 @@ def fetch_option_data(occ_list):
                             stock_time = stock_time.tz_localize('UTC')
 
                         if trade_time < stock_time and iv > 0:
-                            approx_price, stock_at_option_time = approximate_realtime_option_price(underlying_ticker, ticker_sym, spot_price, strike, last_price, trade_time, expiration, opt_type)
+                            approx_price, stock_at_option_time = approximate_realtime_option_price(underlying_ticker, ticker_sym, spot_price, strike, last_price, trade_time, expiration, opt_type, div_q)
                             if approx_price > 0:
                                 estimated_price = approx_price
                                 last_price = approx_price
@@ -726,7 +736,7 @@ if _active_tab == "Portfolio":
     if 'pf_live' not in st.session_state:
         st.session_state['pf_live'] = False
     if 'pf_interval' not in st.session_state:
-        st.session_state['pf_interval'] = 30
+        st.session_state['pf_interval'] = 60
     if 'pf_sort' not in st.session_state:
         st.session_state['pf_sort'] = 'Expiry'
 
@@ -734,7 +744,7 @@ if _active_tab == "Portfolio":
     pf_live_on = pf_ctrl1.toggle("Live Quotes", value=st.session_state['pf_live'], key="pf_live_toggle")
     st.session_state['pf_live'] = pf_live_on
     if pf_live_on:
-        pf_interval = pf_ctrl2.selectbox("Refresh every", [15, 30, 60, 120], index=1, format_func=lambda x: f"{x}s", key="pf_interval_sel")
+        pf_interval = pf_ctrl2.selectbox("Refresh every", [60, 120, 300], index=0, format_func=lambda x: f"{x}s", key="pf_interval_sel")
         st.session_state['pf_interval'] = pf_interval
     pf_sort = pf_ctrl3.selectbox("Sort by", ["Expiry", "Symbol"], index=0 if st.session_state['pf_sort'] == 'Expiry' else 1, key="pf_sort_sel")
     st.session_state['pf_sort'] = pf_sort
@@ -744,12 +754,10 @@ if _active_tab == "Portfolio":
     selected_accounts = st.multiselect("Filter by Account", options=accounts, default=["All"])
 
     if "All" in selected_accounts:
-        filtered_positions = positions
+        filtered_positions = positions.copy()
     else:
-        filtered_positions = positions[positions['Account'].isin(selected_accounts)]
-
-    if pf_live_on:
-        fetch_option_data.clear()
+        filtered_positions = positions[positions['Account'].isin(selected_accounts)].copy()
+    filtered_positions['_orig_idx'] = filtered_positions.index
 
     with st.spinner("Fetching latest market data..."):
         market_data = fetch_option_data(filtered_positions['OCC_Symbol'].tolist())
@@ -803,6 +811,7 @@ if _active_tab == "Portfolio":
 
             is_long_call = (singles_df['Side'].str.upper() == 'LONG') & (singles_df['OptionType'].str.upper() == 'C')
             is_long_put = (singles_df['Side'].str.upper() == 'LONG') & (singles_df['OptionType'].str.upper() == 'P')
+            is_long = singles_df['Side'].str.upper() == 'LONG'
 
             capped_target = np.where(
                 is_long_call,
@@ -814,7 +823,13 @@ if _active_tab == "Portfolio":
                 )
             )
 
-            final_target = np.where(np.isnan(safe_delta), intrinsic_target_stock, capped_target)
+            # intrinsic_target_stock only makes sense for LONG options (targeting high price).
+            # For SHORT options with no delta, we can't estimate the spot target → NaN.
+            final_target = np.where(
+                np.isnan(safe_delta),
+                np.where(is_long, intrinsic_target_stock, np.nan),
+                capped_target
+            )
 
             singles_df['Underlying_Move_Needed_$'] = final_target - singles_df['Underlying_Price']
             singles_df['Target_Hit'] = np.where(
@@ -887,7 +902,8 @@ if _active_tab == "Portfolio":
                     'P&L_%': np.nan,
                     'Days_To_Target_(Theta)': days_to_target,
                     'Underlying_Move_Needed_$': underlying_move,
-                    'Target_Hit': target_hit
+                    'Target_Hit': target_hit,
+                    '_orig_idx': np.nan,
                 })
 
             if aggregated_spreads:
@@ -924,7 +940,7 @@ if _active_tab == "Portfolio":
 
         display_df = display_df[[
             'Account', 'OCC_Symbol', 'Underlying_Price', 'Underlying_Target', 'Side', 'Quantity', 'Entry_Price', 'Current_Price', 'Target_Price',
-            'Unrealized_P&L_$', 'P&L_%', 'Days_To_Target_(Theta)', 'Underlying_Move_Needed_$', 'Target_Hit'
+            'Unrealized_P&L_$', 'P&L_%', 'Days_To_Target_(Theta)', 'Underlying_Move_Needed_$', 'Target_Hit', '_orig_idx'
         ]].copy()
         display_df = display_df.rename(columns={'OCC_Symbol': 'Option'})
 
@@ -936,7 +952,7 @@ if _active_tab == "Portfolio":
         total_pnl = display_df['Unrealized_P&L_$'].sum()
         st.metric(label="Total Portfolio Unrealized P&L", value=f"${total_pnl:,.2f}")
 
-        def position_card_html(row):
+        def position_card_html(row, orig_idx=None):
             option_html  = row['Option']   # already colored HTML
             side         = str(row['Side'])
             qty          = int(row['Quantity']) if pd.notna(row['Quantity']) else 1
@@ -971,10 +987,16 @@ if _active_tab == "Portfolio":
             u_target_str = f"${u_target:.2f}" if pd.notna(u_target) else "—"
 
             badge_html   = ('&nbsp;' + badge) if target_hit else ''
+            edit_icon = (
+                f'<a href="?pf_edit={orig_idx}" title="Edit position" target="_self"'
+                f' style="text-decoration:none;color:#4B5563;font-size:0.8em;'
+                f'position:absolute;top:8px;right:10px;line-height:1;opacity:0.6;">✏️</a>'
+            ) if orig_idx is not None else ''
 
             return (
                 f'<div style="border:1.5px solid {border_color};border-radius:12px;padding:10px 14px;'
-                f'background:{bg_color};display:flex;justify-content:space-between;gap:10px;">'
+                f'background:{bg_color};display:flex;justify-content:space-between;gap:10px;position:relative;">'
+                f'{edit_icon}'
 
                 # LEFT
                 f'<div style="flex:1;min-width:0;">'
@@ -1019,9 +1041,65 @@ if _active_tab == "Portfolio":
             )
             cards_html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;width:100%;">'
             for _, row in acct_df.iterrows():
-                cards_html += position_card_html(row)
+                orig_idx = row.get('_orig_idx', np.nan)
+                cards_html += position_card_html(row, orig_idx=int(orig_idx) if pd.notna(orig_idx) else None)
             cards_html += '</div>'
             st.markdown(cards_html, unsafe_allow_html=True)
+
+        # Inline edit form (triggered by ✏️ icon link on each card)
+        _pf_edit_qp = st.query_params.get('pf_edit')
+        if _pf_edit_qp is not None:
+            edit_idx = int(_pf_edit_qp)
+            edit_row = positions.iloc[edit_idx]
+            st.divider()
+            _edit_spread = f" [{edit_row['SpreadId']}]" if pd.notna(edit_row['SpreadId']) and str(edit_row['SpreadId']).strip() else ""
+            _edit_lbl = f"{edit_row['Ticker']} {edit_row['ExpirationYYMMDD']} {edit_row['OptionType']} {edit_row['Strike']} {edit_row['Side']}{_edit_spread} ({edit_row['Account']})"
+            st.markdown(f"**Edit position:** {_edit_lbl}")
+            with st.form("pf_inline_edit_form"):
+                c1, c2, c3, c4 = st.columns(4)
+                ticker_e   = c1.text_input("Ticker",        value=str(edit_row['Ticker'])).strip().upper()
+                exp_e      = c2.text_input("Expiry YYMMDD", value=str(edit_row['ExpirationYYMMDD']))
+                opt_type_e = c3.selectbox("Type", ["P", "C"], index=0 if edit_row['OptionType'] == 'P' else 1)
+                strike_e   = c4.number_input("Strike", value=float(edit_row['Strike']), step=0.5)
+
+                c5, c6, c7, c8 = st.columns(4)
+                side_e   = c5.selectbox("Side", ["Short", "Long"], index=0 if str(edit_row['Side']).lower() == 'short' else 1)
+                qty_e    = c6.number_input("Quantity",    value=int(edit_row['Quantity']),    min_value=1, step=1)
+                entry_e  = c7.number_input("Entry Price", value=float(edit_row['Entry_Price']), step=0.01)
+                target_e = c8.number_input("Target Price",
+                               value=float(edit_row['Target_Price']) if pd.notna(edit_row['Target_Price']) else 0.0,
+                               step=0.01)
+
+                c9, c10 = st.columns(2)
+                spread_id_e     = c9.text_input("Spread ID",
+                                      value=str(edit_row['SpreadId']) if pd.notna(edit_row['SpreadId']) else '')
+                spread_target_e = c10.number_input("Spread Target",
+                                       value=float(edit_row['Spread_Target']) if pd.notna(edit_row['Spread_Target']) else 0.0,
+                                       step=0.01)
+
+                cs, cc = st.columns(2)
+                submitted = cs.form_submit_button("Save Changes", use_container_width=True)
+                cancelled = cc.form_submit_button("Cancel",       use_container_width=True)
+
+            if submitted:
+                positions.at[edit_idx, 'Ticker']           = ticker_e
+                positions.at[edit_idx, 'ExpirationYYMMDD'] = int(exp_e)
+                positions.at[edit_idx, 'OptionType']       = opt_type_e
+                positions.at[edit_idx, 'Strike']           = float(strike_e)
+                positions.at[edit_idx, 'Side']             = side_e
+                positions.at[edit_idx, 'Quantity']         = int(qty_e)
+                positions.at[edit_idx, 'Entry_Price']      = float(entry_e)
+                positions.at[edit_idx, 'Target_Price']     = float(target_e) if target_e else np.nan
+                positions.at[edit_idx, 'SpreadId']         = spread_id_e.strip() if spread_id_e.strip() else np.nan
+                positions.at[edit_idx, 'Spread_Target']    = float(spread_target_e) if spread_target_e else np.nan
+                save_account_to_file(positions, edit_row['Account'])
+                fetch_option_data.clear()
+                del st.query_params['pf_edit']
+                st.success("Position updated.")
+                st.rerun()
+            if cancelled:
+                del st.query_params['pf_edit']
+                st.rerun()
 
         pf_updated_str = datetime.now().strftime("%H:%M:%S")
         pf_status_color = '#22c55e' if pf_live_on else '#6B7280'
@@ -1258,15 +1336,18 @@ def fetch_watchlist_prices(occ_list):
     """Fetches current option price, underlying spot price, and delta for watchlist items."""
     results = {}
     r_free = 0.045
-    for occ in occ_list:
+    for i, occ in enumerate(occ_list):
+        if i > 0:
+            time.sleep(0.3)
         parsed = parse_occ(occ)
         if not parsed:
             results[occ] = {'option_price': None, 'spot': None, 'delta': None, 'gamma': None}
             continue
         ticker, expiration, opt_type, strike = parsed
         try:
-            underlying_ticker = _yf_ticker(ticker)
-            spot, stock_date = get_latest_price(underlying_ticker)
+            yf_sym = yf_ticker(ticker)
+            underlying_ticker = _yf_ticker(yf_sym)
+            spot, stock_date = get_latest_price(yf_sym)  # cached 60 s
             chain = underlying_ticker.option_chain(expiration)
             options = chain.calls if opt_type == 'C' else chain.puts
             contract = options[options['strike'] == strike]
@@ -1397,10 +1478,11 @@ def fetch_benchmark_history(tickers_tuple, start_date_str):
 def fetch_trade_live_prices(tickers_tuple):
     """Fetch current prices for open stock positions tracked in the trades journal."""
     result = {}
-    for ticker in tickers_tuple:
+    for i, ticker in enumerate(tickers_tuple):
+        if i > 0:
+            time.sleep(0.3)
         try:
-            t = _yf_ticker(ticker)
-            price, _ = get_latest_price(t)
+            price, _ = get_latest_price(ticker)  # cached 60 s
             result[ticker] = price
         except Exception:
             result[ticker] = None
@@ -1558,9 +1640,9 @@ def watchlist_occ(row):
     exp_str = str(int(row['ExpirationYYMMDD']))
     yy, mm, dd = exp_str[:2], exp_str[2:4], exp_str[4:]
     strike_fmt = f"{int(float(row['Strike']) * 1000):08d}"
-    return f"{str(row['Ticker']).upper()}{yy}{mm}{dd}{str(row['OptionType']).upper()}{strike_fmt}"
+    return f"{occ_ticker(row['Ticker'])}{yy}{mm}{dd}{str(row['OptionType']).upper()}{strike_fmt}"
 
-def watchlist_card_html(row, data):
+def watchlist_card_html(row, data, idx=None):
     ticker   = str(row['Ticker']).upper()
     opt_type = str(row['OptionType']).upper()
     exp_str  = str(int(row['ExpirationYYMMDD']))
@@ -1616,10 +1698,13 @@ def watchlist_card_html(row, data):
     option_price_str = f"${current_price:.2f}" if current_price is not None else "N/A"
     spot_str         = f"${spot:,.2f}"          if spot is not None          else "N/A"
     badge = '<span style="background:#22c55e;color:#000;font-size:0.65em;padding:2px 6px;border-radius:4px;margin-left:6px;font-weight:bold;">TARGET HIT</span>' if hit else ''
+    edit_icon = (f'<a href="?wl_edit={idx}" title="Edit" target="_self" style="text-decoration:none;color:#4B5563;'
+                 f'font-size:0.8em;position:absolute;top:8px;right:10px;opacity:0.6;">✏️</a>') if idx is not None else ''
 
     return f"""
 <div style="border:1.5px solid {border_color};border-radius:10px;padding:14px 18px;
-            background:{bg_color};">
+            background:{bg_color};position:relative;">
+  {edit_icon}
   <div style="font-size:1.1em;font-weight:bold;color:#e2e8f0;">
     <span style="color:#60A5FA">{ticker}</span>
     <span style="color:{type_color};margin-left:4px">{opt_type}</span>
@@ -1647,17 +1732,19 @@ def watchlist_card_html(row, data):
 def fetch_stock_prices(tickers):
     """Fetches price, day change, and technical indicators for a tuple of stock tickers."""
     results = {}
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers):
+        if i > 0:
+            time.sleep(0.3)
         try:
             t = _yf_ticker(ticker)
-            hist = t.history(period="1y", prepost=True)
+            hist = t.history(period="1y", interval="1d")
             if hist.empty:
                 raise ValueError("No data returned")
 
             close = hist['Close']
 
-            # Price & day change
-            price, _  = get_latest_price(t)
+            # Price & day change — use cached get_latest_price for current prepost price
+            price, _  = get_latest_price(ticker)  # cached 60 s
             prev   = float(close.iloc[-2]) if len(close) >= 2 else float(close.iloc[-1])
             change     = price - prev
             change_pct = (change / prev * 100) if prev else 0
@@ -1697,7 +1784,7 @@ def fetch_stock_prices(tickers):
             }
     return results
 
-def stock_card_html(row, data):
+def stock_card_html(row, data, idx=None):
     ticker = str(row['Ticker']).upper()
     target = float(row['TargetPrice']) if pd.notna(row['TargetPrice']) and float(row['TargetPrice']) != 0 else None
     intent = str(row['Intent']).strip().lower() if pd.notna(row['Intent']) and str(row['Intent']).strip() else 'buy'
@@ -1795,9 +1882,13 @@ def stock_card_html(row, data):
     </div>
   </div>"""
 
+    edit_icon = (f'<a href="?wl_edit={idx}" title="Edit" target="_self" style="text-decoration:none;color:#4B5563;'
+                 f'font-size:0.8em;position:absolute;top:8px;right:10px;opacity:0.6;">✏️</a>') if idx is not None else ''
+
     return f"""
 <div style="border:1.5px solid {border_color};border-radius:10px;padding:14px 18px;
-            background:{bg_color};">
+            background:{bg_color};position:relative;">
+  {edit_icon}
   <div style="display:flex;align-items:center;justify-content:space-between;">
     <div style="font-size:1.1em;font-weight:bold;">
       <span style="color:#60A5FA">{ticker}</span>
@@ -1844,10 +1935,11 @@ def _format_pdf_symbol(name, symbol, is_option):
 def fetch_summary_equity_prices(tickers_tuple):
     """Lightweight batch equity price fetch for the Summary tab (5-min cache)."""
     result = {}
-    for ticker in tickers_tuple:
+    for i, ticker in enumerate(tickers_tuple):
+        if i > 0:
+            time.sleep(0.3)
         try:
-            t = _yf_ticker(ticker)
-            price, _ = get_latest_price(t)
+            price, _ = get_latest_price(ticker)  # cached 60 s
             result[ticker] = price
         except Exception:
             result[ticker] = None
@@ -2064,14 +2156,14 @@ if _active_tab == "Watchlist":
     if 'wl_live' not in st.session_state:
         st.session_state['wl_live'] = False
     if 'wl_interval' not in st.session_state:
-        st.session_state['wl_interval'] = 30
+        st.session_state['wl_interval'] = 60
 
     ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 4])
     live_on = ctrl1.toggle("Live Quotes", value=st.session_state['wl_live'], key="wl_live_toggle")
     st.session_state['wl_live'] = live_on
 
     if live_on:
-        interval = ctrl2.selectbox("Refresh every", [15, 30, 60, 120], index=1, format_func=lambda x: f"{x}s", key="wl_interval_sel")
+        interval = ctrl2.selectbox("Refresh every", [60, 120, 300], index=0, format_func=lambda x: f"{x}s", key="wl_interval_sel")
         st.session_state['wl_interval'] = interval
 
     if not watchlist.empty:
@@ -2110,12 +2202,77 @@ if _active_tab == "Watchlist":
         for idx, row in watchlist.iterrows():
             if row['ItemType'] == 'stock':
                 ticker = str(row['Ticker']).upper()
-                cards_html += stock_card_html(row, stock_price_data.get(ticker))
+                cards_html += stock_card_html(row, stock_price_data.get(ticker), idx=idx)
             else:
                 occ = option_occs.get(idx)
-                cards_html += watchlist_card_html(row, option_prices.get(occ))
+                cards_html += watchlist_card_html(row, option_prices.get(occ), idx=idx)
         cards_html += '</div>'
         st.markdown(cards_html, unsafe_allow_html=True)
+
+        # Inline edit form (triggered by ✏️ icon link on each card)
+        _wl_edit_qp = st.query_params.get('wl_edit')
+        if _wl_edit_qp is not None:
+            wl_ei = int(_wl_edit_qp)
+            wl_er = watchlist.loc[wl_ei]
+            st.divider()
+            wl_er_type = str(wl_er.get('ItemType', 'option'))
+            if wl_er_type == 'stock':
+                st.markdown(f"**Edit:** {wl_er['Ticker']} (Stock)")
+                with st.form("wl_inline_edit_stock"):
+                    c1, c2, c3 = st.columns([2, 2, 2])
+                    wl_e_ticker = c1.text_input("Ticker", value=str(wl_er['Ticker'])).strip().upper()
+                    cur_target  = float(wl_er['TargetPrice']) if pd.notna(wl_er['TargetPrice']) else 0.0
+                    wl_e_target = c2.number_input("Alert Price", value=cur_target, step=0.01)
+                    cur_intent  = str(wl_er['Intent']).strip().lower() if pd.notna(wl_er['Intent']) else 'buy'
+                    wl_e_intent = c3.selectbox("Alert Direction", ["Buy below", "Sell above"], index=0 if cur_intent == 'buy' else 1)
+                    wl_e_label  = st.text_input("Label", value=str(wl_er['Label']) if pd.notna(wl_er['Label']) else '')
+                    cs, cc = st.columns(2)
+                    saved     = cs.form_submit_button("Save Changes", use_container_width=True)
+                    cancelled = cc.form_submit_button("Cancel",       use_container_width=True)
+                if saved:
+                    watchlist.at[wl_ei, 'Ticker']      = wl_e_ticker
+                    watchlist.at[wl_ei, 'TargetPrice'] = float(wl_e_target)
+                    watchlist.at[wl_ei, 'Intent']      = 'buy' if wl_e_intent == 'Buy below' else 'sell'
+                    watchlist.at[wl_ei, 'Label']       = wl_e_label.strip()
+                    save_watchlist(watchlist)
+                    fetch_stock_prices.clear()
+                    del st.query_params['wl_edit']
+                    st.success("Watchlist item updated.")
+                    st.rerun()
+                if cancelled:
+                    del st.query_params['wl_edit']
+                    st.rerun()
+            else:
+                st.markdown(f"**Edit:** {wl_er['Ticker']} {wl_er['OptionType']} {wl_er['ExpirationYYMMDD']} ${wl_er['Strike']}")
+                with st.form("wl_inline_edit_option"):
+                    c1, c2, c3, c4, c5, c6 = st.columns(6)
+                    wl_e_ticker  = c1.text_input("Ticker",        value=str(wl_er['Ticker'])).strip().upper()
+                    wl_e_exp     = c2.text_input("Expiry YYMMDD", value=str(int(wl_er['ExpirationYYMMDD'])))
+                    wl_e_type    = c3.selectbox("Type", ["P", "C"], index=0 if wl_er['OptionType'] == 'P' else 1)
+                    wl_e_strike  = c4.number_input("Strike",       value=float(wl_er['Strike']),       step=0.5)
+                    wl_e_target  = c5.number_input("Target Price", value=float(wl_er['TargetPrice']),  step=0.01)
+                    cur_intent   = str(wl_er['Intent']).strip().lower() if pd.notna(wl_er['Intent']) and str(wl_er['Intent']).strip() else 'buy'
+                    wl_e_intent  = c6.selectbox("Intent", ["Buy", "Sell"], index=0 if cur_intent == 'buy' else 1)
+                    wl_e_label   = st.text_input("Label", value=str(wl_er['Label']) if pd.notna(wl_er['Label']) else '')
+                    cs, cc = st.columns(2)
+                    saved     = cs.form_submit_button("Save Changes", use_container_width=True)
+                    cancelled = cc.form_submit_button("Cancel",       use_container_width=True)
+                if saved:
+                    watchlist.at[wl_ei, 'Ticker']           = wl_e_ticker
+                    watchlist.at[wl_ei, 'ExpirationYYMMDD'] = int(wl_e_exp)
+                    watchlist.at[wl_ei, 'OptionType']       = wl_e_type
+                    watchlist.at[wl_ei, 'Strike']           = float(wl_e_strike)
+                    watchlist.at[wl_ei, 'TargetPrice']      = float(wl_e_target)
+                    watchlist.at[wl_ei, 'Intent']           = wl_e_intent.lower()
+                    watchlist.at[wl_ei, 'Label']            = wl_e_label.strip()
+                    save_watchlist(watchlist)
+                    fetch_watchlist_prices.clear()
+                    del st.query_params['wl_edit']
+                    st.success("Watchlist item updated.")
+                    st.rerun()
+                if cancelled:
+                    del st.query_params['wl_edit']
+                    st.rerun()
 
         col_a, col_b = st.columns([1, 5])
         if col_a.button("Refresh", key="wl_refresh"):
@@ -2283,12 +2440,15 @@ if _active_tab == "Watchlist":
 def fetch_sentiment_prices(tickers):
     """Fetches current prices for a list of tickers from Yahoo Finance."""
     results = {}
-    for ticker_id, ticker_info in tickers.items():
+    for i, (ticker_id, ticker_info) in enumerate(tickers.items()):
+        if i > 0:
+            time.sleep(0.3)
         try:
-            ticker = _yf_ticker(ticker_id)
-            hist = ticker.history(period="5d", prepost=True)
-            price, _ = get_latest_price(ticker)
-            prev  = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else float(hist['Close'].iloc[-1])
+            price, _ = get_latest_price(ticker_id)  # cached 60 s
+            # Fetch a short daily history only to get the previous close for day-change calc
+            t = _yf_ticker(ticker_id)
+            hist_daily = t.history(period="5d", interval="1d")
+            prev = float(hist_daily['Close'].iloc[-2]) if len(hist_daily) >= 2 else price
             change = price - prev
             change_pct = (change / prev * 100) if prev else 0
             results[ticker_id] = {
@@ -2325,7 +2485,7 @@ def fetch_ibit_approx():
 
         ratio = ibit_close / btc_close  # IBIT price per $1 of BTC
 
-        btc_current, _ = get_latest_price(btc)
+        btc_current, _ = get_latest_price("BTC-USD")  # cached 60 s
         approx_price = ratio * btc_current
         change = approx_price - ibit_close
         change_pct = (change / ibit_close * 100) if ibit_close else 0
@@ -2470,17 +2630,14 @@ if _active_tab == "Sentiment":
     if 'sent_live' not in st.session_state:
         st.session_state['sent_live'] = False
     if 'sent_interval' not in st.session_state:
-        st.session_state['sent_interval'] = 30
+        st.session_state['sent_interval'] = 60
 
     sent_ctrl1, sent_ctrl2, sent_ctrl3 = st.columns([2, 2, 4])
     sent_live_on = sent_ctrl1.toggle("Live Quotes", value=st.session_state['sent_live'], key="sent_live_toggle")
     st.session_state['sent_live'] = sent_live_on
     if sent_live_on:
-        sent_interval = sent_ctrl2.selectbox("Refresh every", [15, 30, 60, 120], index=1, format_func=lambda x: f"{x}s", key="sent_interval_sel")
+        sent_interval = sent_ctrl2.selectbox("Refresh every", [60, 120, 300], index=0, format_func=lambda x: f"{x}s", key="sent_interval_sel")
         st.session_state['sent_interval'] = sent_interval
-
-    if sent_live_on:
-        fetch_sentiment_prices.clear()
 
     # Prices
     tickers_to_fetch = {
@@ -2607,6 +2764,7 @@ if _active_tab == "Sentiment":
         sent_countdown.empty()
         fetch_sentiment_prices.clear()
         fetch_ibit_approx.clear()
+        st.rerun()
 
 def _get_rotation_state(strat_trades):
     """
@@ -2754,8 +2912,8 @@ def _trades_tab():
                             e_event    = r1c.selectbox("Event Type", _et_list, index=_et_idx, key=f"ed_ev_{trade_id}")
 
                             r2a, r2b, r2c = st.columns(3)
-                            e_qty   = r2a.number_input("Qty / Shares", value=float(row.get('qty', 0) or 0), min_value=0.0, step=1.0, key=f"ed_qt_{trade_id}")
-                            e_price = r2b.number_input("Price", value=float(row.get('price', 0) or 0), min_value=0.0, step=0.01, key=f"ed_pr_{trade_id}")
+                            e_qty   = r2a.number_input("Qty / Shares", value=float(row.get('qty', 0) or 0), min_value=0.0, step=1.0, format="%.3f", key=f"ed_qt_{trade_id}")
+                            e_price = r2b.number_input("Price", value=float(row.get('price', 0) or 0), min_value=0.0, step=0.001, format="%.3f", key=f"ed_pr_{trade_id}")
                             e_fees  = r2c.number_input("Fees", value=float(row.get('fees', 0) or 0), min_value=0.0, step=0.01, key=f"ed_fe_{trade_id}")
 
                             r3a, r3b, r3c = st.columns(3)
@@ -3224,8 +3382,8 @@ def _trades_tab():
 
                 else:  # Buy Stock / Sell Stock
                     sc1, sc2    = st.columns(2)
-                    tr_qty      = sc1.number_input("Shares", min_value=1, step=1, value=100, key="tr_add_qty_stk_f")
-                    tr_price    = sc2.number_input("Price per share ($)", min_value=0.01, step=0.01, value=100.0, key="tr_add_price_stk_f")
+                    tr_qty      = sc1.number_input("Shares", min_value=0.001, step=1.0, value=100.0, format="%.3f", key="tr_add_qty_stk_f")
+                    tr_price    = sc2.number_input("Price per share ($)", min_value=0.001, step=0.001, value=100.0, format="%.3f", key="tr_add_price_stk_f")
                     tr_strike   = np.nan
                     tr_expiry   = ""
                     tr_opt_type = ""
