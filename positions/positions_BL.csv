@@ -1,1 +1,2 @@
-OCC_Symbol,Side,Quantity,Entry_Price,Target_Price
+Ticker,ExpirationYYMMDD,OptionType,Strike,Side,Quantity,Entry_Price,Target_Price,SpreadId,Spread_Target
+ORCL,260529,P,155.0,Short,1,6.53,2.0,,
