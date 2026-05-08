@@ -1,2 +1,4 @@
 Ticker,ExpirationYYMMDD,OptionType,Strike,Side,Quantity,Entry_Price,Target_Price,SpreadId,Spread_Target
 NVDA,260515,C,190.0,Short,1,5.0,1.8,,
+IBIT,260618,C,52.0,Short,3,0.81,0.3,,
+SNAP,260618,C,7.0,Short,6,0.27,,,

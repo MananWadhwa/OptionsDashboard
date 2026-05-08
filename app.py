@@ -158,19 +158,8 @@ def implied_volatility(target_price, S, K, T, r, q, option_type):
     except ValueError:
         return None
 
-# Simple cache for 1m history to avoid redundant API calls per ticker
-_hist_1m_cache = {}
-
-def approximate_realtime_option_price(ticker_obj, ticker_sym, actual_stock_price, strike, last_price, trade_time, exp_date_str, opt_type, q=0.0):
+def approximate_realtime_option_price(hist, actual_stock_price, strike, last_price, trade_time, exp_date_str, opt_type, q=0.0):
     try:
-        if ticker_sym not in _hist_1m_cache:
-            hist = ticker_obj.history(period="5d", interval="1m")
-            if not hist.empty:
-                hist.index = hist.index.tz_convert('UTC')
-            _hist_1m_cache[ticker_sym] = hist
-
-        hist = _hist_1m_cache[ticker_sym]
-
         if hist.empty:
             stock_price_at_trade = actual_stock_price
         else:
@@ -242,11 +231,12 @@ def format_occ_html(plain_option):
 @st.cache_data(ttl=60)
 def get_latest_price(symbol: str):
     """Fetches the most up-to-date spot price and timestamp, including pre/post market.
-    Cached for 60 s to prevent duplicate YF requests across tabs and functions."""
-    ticker_obj = _yf_ticker(symbol)
-    hist = ticker_obj.history(period="5d", interval="1m", prepost=True)
+    Reuses _fetch_hist_1m so no extra request is made when both are called for the same ticker."""
+    hist = _fetch_hist_1m(symbol)
     if not hist.empty:
         return float(hist['Close'].iloc[-1]), hist.index[-1]
+    # fallback: daily bar if 1m history unavailable
+    ticker_obj = _yf_ticker(symbol)
     hist = ticker_obj.history(period="1d", prepost=True)
     if not hist.empty:
         return float(hist['Close'].iloc[-1]), hist.index[-1]
@@ -261,6 +251,36 @@ def _get_div_yield(symbol: str) -> float:
         return dv / 100
     except Exception:
         return 0.0
+
+@st.cache_data(ttl=60)
+def _fetch_hist_1m(symbol: str) -> pd.DataFrame:
+    """5-day 1-minute history (prepost). Shared by get_latest_price and approx pricing. Cached 60 s."""
+    t = _yf_ticker(symbol)
+    hist = t.history(period="5d", interval="1m", prepost=True)
+    if not hist.empty:
+        hist.index = hist.index.tz_convert('UTC')
+    return hist
+
+@st.cache_data(ttl=3600)
+def _fetch_hist_vol(symbol: str) -> float:
+    """Annualised historical vol from 6-month daily closes. Cached 1 hour."""
+    try:
+        t = _yf_ticker(symbol)
+        hist = t.history(period="6mo", interval="1d")['Close']
+        if hist.empty:
+            return 0.25
+        vol = float(np.log(hist / hist.shift(1)).std() * np.sqrt(252))
+        return vol if not np.isnan(vol) and vol >= 0.05 else 0.25
+    except Exception:
+        return 0.25
+
+@st.cache_data(ttl=3600)
+def _fetch_available_exps(symbol: str) -> list:
+    """Available option expiration dates for a ticker. Cached 1 hour."""
+    try:
+        return list(_yf_ticker(symbol).options)
+    except Exception:
+        return []
 
 def _yf_fetch_with_retry(fn, retries=3, base_delay=3):
     """Calls fn(), retrying on rate-limit errors with exponential backoff."""
@@ -304,26 +324,12 @@ def fetch_option_data(occ_list):
             yf_sym = yf_ticker(ticker_sym)
             underlying_ticker = _yf_ticker(yf_sym)
 
-            def fetch_spot_and_vol(t, sym=yf_sym):
-                hist = t.history(period="6mo", interval="1d")['Close']
-                if hist.empty:
-                    raise Exception("No price history")
-                spot, stock_date = get_latest_price(sym)  # cached 60 s
-                returns = np.log(hist / hist.shift(1))
-                vol = float(returns.std() * np.sqrt(252))
-                q = _get_div_yield(sym)  # cached 1 h
-                return spot, vol, stock_date, q
-
-            spot_price, hist_vol, stock_date, div_q = _yf_fetch_with_retry(
-                lambda t=underlying_ticker: fetch_spot_and_vol(t)
-            )
-            if pd.isna(hist_vol) or hist_vol < 0.05:
-                hist_vol = 0.25
-
-            # Fetch each unique expiration once per ticker
-            available_exps = _yf_fetch_with_retry(
-                lambda t=underlying_ticker: list(t.options)
-            )
+            # All three calls are individually cached (1h or 60s) and survive
+            # fetch_option_data.clear(), so Live-refresh only re-fetches option chains.
+            hist_vol   = _fetch_hist_vol(yf_sym)           # cached 1 h
+            spot_price, stock_date = get_latest_price(yf_sym)  # cached 60 s (reuses _fetch_hist_1m)
+            div_q      = _get_div_yield(yf_sym)            # cached 1 h
+            available_exps = _fetch_available_exps(yf_sym) # cached 1 h
             chains = {}
             for occ, (_, expiration, _, _) in contracts:
                 if expiration not in chains:
@@ -383,7 +389,7 @@ def fetch_option_data(occ_list):
                             stock_time = stock_time.tz_localize('UTC')
 
                         if trade_time < stock_time and iv > 0:
-                            approx_price, stock_at_option_time = approximate_realtime_option_price(underlying_ticker, ticker_sym, spot_price, strike, last_price, trade_time, expiration, opt_type, div_q)
+                            approx_price, stock_at_option_time = approximate_realtime_option_price(_fetch_hist_1m(yf_sym), spot_price, strike, last_price, trade_time, expiration, opt_type, div_q)
                             if approx_price > 0:
                                 estimated_price = approx_price
                                 last_price = approx_price
@@ -662,7 +668,7 @@ st.markdown(
     'padding:4px 0 10px;letter-spacing:0.01em;">Options Tracker</div>',
     unsafe_allow_html=True
 )
-_TAB_NAMES = ["Portfolio", "Watchlist", "Sentiment", "Summary", "Trades"]
+_TAB_NAMES = ["Portfolio", "Watchlist", "Sentiment", "Summary", "Trades", "Chart"]
 if "active_tab" not in st.session_state:
     st.session_state.active_tab = "Portfolio"
 
@@ -3144,9 +3150,11 @@ def _trades_tab():
                     rc1, rc2 = st.columns(2)
                     tr_rot_date = rc1.date_input("Date", value=datetime.today(), key="tr_rot_date_f")
                     tr_rot_qty  = rc2.number_input("Shares", min_value=0.001, step=1.0, value=100.0, format="%.3f", key="tr_rot_qty_f")
-                    rp1, rp2   = st.columns(2)
-                    tr_rot_price = rp1.number_input("Price per share ($)", min_value=0.001, step=0.001, value=100.0, format="%.3f", key="tr_rot_price_f")
-                    tr_rot_fees  = rp2.number_input("Fees ($)", min_value=0.0, step=0.01, value=0.0, key="tr_rot_fees_f")
+                    rp1, rp2, rp3 = st.columns(3)
+                    tr_rot_price       = rp1.number_input("Price per share ($)", min_value=0.0, step=0.001, value=0.0, format="%.3f", key="tr_rot_price_f")
+                    tr_rot_total_price = rp2.number_input("Total price ($)", min_value=0.0, step=0.01, value=0.0, format="%.2f", key="tr_rot_total_price_f")
+                    tr_rot_fees        = rp3.number_input("Fees ($)", min_value=0.0, step=0.01, value=0.0, key="tr_rot_fees_f")
+                    st.caption("Fill either **Price per share** or **Total price** — the other will be derived.")
                     tr_rot_notes = st.text_input("Notes (optional)", key="tr_rot_notes_f").strip()
                     rot_submitted = st.form_submit_button("Log Trade", type="primary")
 
@@ -3156,6 +3164,12 @@ def _trades_tab():
                     elif not tr_rot_ticker:
                         st.error("Ticker is required.")
                     else:
+                        # Derive price per share from total price if provided
+                        if tr_rot_total_price > 0 and float(tr_rot_qty) > 0:
+                            tr_rot_price = tr_rot_total_price / float(tr_rot_qty)
+                        elif tr_rot_price == 0.0 and tr_rot_total_price == 0.0:
+                            st.error("Enter either Price per share or Total price.")
+                            st.stop()
                         next_id = int(trades['id'].max() + 1) if not trades.empty and pd.notna(trades['id']).any() else 1
                         new_row = pd.DataFrame([{
                             'id':               next_id,
@@ -3312,6 +3326,7 @@ def _trades_tab():
                     icon="💡"
                 )
 
+            tr_total_price = 0.0  # only used for stock trades; initialized here for all paths
             with st.form("tr_add_form", clear_on_submit=True):
                 tr_date = st.date_input("Date", value=datetime.today(), key="tr_add_date_f")
 
@@ -3381,9 +3396,11 @@ def _trades_tab():
                         tr_cap_res = np.nan
 
                 else:  # Buy Stock / Sell Stock
-                    sc1, sc2    = st.columns(2)
-                    tr_qty      = sc1.number_input("Shares", min_value=0.001, step=1.0, value=100.0, format="%.3f", key="tr_add_qty_stk_f")
-                    tr_price    = sc2.number_input("Price per share ($)", min_value=0.001, step=0.001, value=100.0, format="%.3f", key="tr_add_price_stk_f")
+                    sc1, sc2, sc3 = st.columns(3)
+                    tr_qty        = sc1.number_input("Shares", min_value=0.001, step=1.0, value=100.0, format="%.3f", key="tr_add_qty_stk_f")
+                    tr_price      = sc2.number_input("Price per share ($)", min_value=0.0, step=0.001, value=0.0, format="%.3f", key="tr_add_price_stk_f")
+                    tr_total_price = sc3.number_input("Total price ($)", min_value=0.0, step=0.01, value=0.0, format="%.2f", key="tr_add_total_price_stk_f")
+                    st.caption("Fill either **Price per share** or **Total price** — the other will be derived.")
                     tr_strike   = np.nan
                     tr_expiry   = ""
                     tr_opt_type = ""
@@ -3402,6 +3419,13 @@ def _trades_tab():
                 elif not tr_strategy:
                     st.error("Strategy name is required.")
                 else:
+                    # Derive price per share from total price if provided (stock trades only)
+                    if not is_dividend and not is_opt_sell:
+                        if tr_total_price > 0 and float(tr_qty) > 0:
+                            tr_price = tr_total_price / float(tr_qty)
+                        elif tr_price == 0.0 and tr_total_price == 0.0:
+                            st.error("Enter either Price per share or Total price.")
+                            st.stop()
                     next_id = int(trades['id'].max() + 1) if not trades.empty and pd.notna(trades['id']).any() else 1
                     new_row = pd.DataFrame([{
                         'id':               next_id,
@@ -3676,3 +3700,210 @@ def _trades_tab():
 
 if _active_tab == "Trades":
     _trades_tab()
+
+if _active_tab == "Chart":
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    col_ticker, col_period, col_interval, col_refresh = st.columns([2, 2, 2, 1])
+    with col_ticker:
+        chart_ticker = st.text_input("Ticker", value="SPY", key="chart_ticker",
+                                     placeholder="e.g. AAPL, TSLA, SPY").upper().strip()
+    with col_period:
+        period_options = {"1D": "1d", "5D": "5d", "1M": "1mo", "3M": "3mo",
+                          "6M": "6mo", "1Y": "1y", "2Y": "2y", "5Y": "5y"}
+        chart_period_label = st.selectbox("Period", list(period_options.keys()),
+                                          index=2, key="chart_period")
+        chart_period = period_options[chart_period_label]
+    with col_interval:
+        interval_map = {
+            "1D":  [("1m","1m"),("5m","5m"),("15m","15m"),("30m","30m"),("1h","1h")],
+            "5D":  [("5m","5m"),("15m","15m"),("30m","30m"),("1h","1h"),("1d","1D")],
+            "1M":  [("30m","30m"),("1h","1h"),("1d","1D"),("1wk","1W")],
+            "3M":  [("1h","1h"),("1d","1D"),("1wk","1W")],
+            "6M":  [("1d","1D"),("1wk","1W")],
+            "1Y":  [("1d","1D"),("1wk","1W"),("1mo","1M")],
+            "2Y":  [("1d","1D"),("1wk","1W"),("1mo","1M")],
+            "5Y":  [("1wk","1W"),("1mo","1M")],
+        }
+        allowed = interval_map.get(chart_period_label, [("1d","1D")])
+        interval_labels = [lbl for _, lbl in allowed]
+        interval_vals   = [val for val, _ in allowed]
+        default_interval_idx = min(2, len(interval_labels) - 1)
+        interval_label = st.selectbox("Interval", interval_labels,
+                                      index=default_interval_idx, key="chart_interval")
+        chart_interval = interval_vals[interval_labels.index(interval_label)]
+    with col_refresh:
+        st.write("")
+        auto_refresh = st.toggle("Live", value=False, key="chart_live")
+
+    # ── Indicators row ─────────────────────────────────────────────────────────
+    ic1, ic2, ic3, ic4 = st.columns(4)
+    with ic1:
+        show_ema20  = st.checkbox("EMA 20",  value=True,  key="chart_ema20")
+    with ic2:
+        show_ema50  = st.checkbox("EMA 50",  value=True,  key="chart_ema50")
+    with ic3:
+        show_ema200 = st.checkbox("EMA 200", value=False, key="chart_ema200")
+    with ic4:
+        show_bb     = st.checkbox("Bollinger Bands", value=False, key="chart_bb")
+
+    # ── Fetch data ─────────────────────────────────────────────────────────────
+    chart_placeholder = st.empty()
+
+    @st.cache_data(ttl=60)
+    def _fetch_chart_data(ticker, period, interval):
+        t = _yf_ticker(ticker)
+        df = t.history(period=period, interval=interval, auto_adjust=True)
+        if df.empty:
+            return None, None
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert("America/New_York")
+        info = {}
+        try:
+            raw = t.fast_info
+            info["name"]  = getattr(raw, "quote_type", ticker)
+            info["price"] = getattr(raw, "last_price", None)
+            info["prev"]  = getattr(raw, "previous_close", None)
+        except Exception:
+            pass
+        return df, info
+
+    if chart_ticker:
+        with st.spinner(f"Loading {chart_ticker}…"):
+            df, info = _fetch_chart_data(chart_ticker, chart_period, chart_interval)
+
+        if df is None or df.empty:
+            st.error(f"No data found for **{chart_ticker}**. Check the ticker symbol.")
+        else:
+            # ── Build Plotly figure ────────────────────────────────────────────
+            fig = make_subplots(
+                rows=2, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.03,
+                row_heights=[0.75, 0.25],
+            )
+
+            # Candlesticks
+            fig.add_trace(go.Candlestick(
+                x=df.index,
+                open=df["Open"], high=df["High"],
+                low=df["Low"],  close=df["Close"],
+                name=chart_ticker,
+                increasing_line_color="#26a69a",
+                decreasing_line_color="#ef5350",
+                increasing_fillcolor="#26a69a",
+                decreasing_fillcolor="#ef5350",
+                line_width=1,
+            ), row=1, col=1)
+
+            # EMAs
+            if show_ema20:
+                ema20 = df["Close"].ewm(span=20, adjust=False).mean()
+                fig.add_trace(go.Scatter(x=df.index, y=ema20, name="EMA 20",
+                    line=dict(color="#f9ca24", width=1.2)), row=1, col=1)
+            if show_ema50:
+                ema50 = df["Close"].ewm(span=50, adjust=False).mean()
+                fig.add_trace(go.Scatter(x=df.index, y=ema50, name="EMA 50",
+                    line=dict(color="#6c5ce7", width=1.2)), row=1, col=1)
+            if show_ema200:
+                ema200 = df["Close"].ewm(span=200, adjust=False).mean()
+                fig.add_trace(go.Scatter(x=df.index, y=ema200, name="EMA 200",
+                    line=dict(color="#fd79a8", width=1.5)), row=1, col=1)
+
+            # Bollinger Bands
+            if show_bb:
+                sma20 = df["Close"].rolling(20).mean()
+                std20 = df["Close"].rolling(20).std()
+                bb_upper = sma20 + 2 * std20
+                bb_lower = sma20 - 2 * std20
+                fig.add_trace(go.Scatter(x=df.index, y=bb_upper, name="BB Upper",
+                    line=dict(color="rgba(129,236,236,0.6)", width=1, dash="dot")), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=sma20, name="BB Mid",
+                    line=dict(color="rgba(129,236,236,0.4)", width=1)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=bb_lower, name="BB Lower",
+                    line=dict(color="rgba(129,236,236,0.6)", width=1, dash="dot"),
+                    fill="tonexty", fillcolor="rgba(129,236,236,0.04)"), row=1, col=1)
+
+            # Volume bars
+            colors = ["#26a69a" if c >= o else "#ef5350"
+                      for c, o in zip(df["Close"], df["Open"])]
+            fig.add_trace(go.Bar(
+                x=df.index, y=df["Volume"],
+                name="Volume", marker_color=colors,
+                marker_line_width=0, showlegend=False,
+            ), row=2, col=1)
+
+            # ── Layout ─────────────────────────────────────────────────────────
+            last_close = df["Close"].iloc[-1]
+            prev_close = info.get("prev") or df["Close"].iloc[-2] if len(df) > 1 else last_close
+            pct_chg    = (last_close - prev_close) / prev_close * 100 if prev_close else 0
+            chg_color  = "#26a69a" if pct_chg >= 0 else "#ef5350"
+
+            fig.update_layout(
+                paper_bgcolor="#0e1117",
+                plot_bgcolor="#0e1117",
+                font=dict(color="#d1d4dc", size=12),
+                title=dict(
+                    text=(f"<b>{chart_ticker}</b>  "
+                          f"<span style='color:{chg_color}'>"
+                          f"${last_close:.2f}  {pct_chg:+.2f}%</span>"),
+                    font=dict(size=16, color="#e2e8f0"),
+                    x=0.01,
+                ),
+                margin=dict(l=0, r=0, t=48, b=0),
+                height=600,
+                xaxis_rangeslider_visible=False,
+                legend=dict(
+                    bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=11),
+                    orientation="h",
+                    x=0, y=1.04,
+                ),
+                hovermode="x unified",
+                hoverlabel=dict(bgcolor="#1e222d", font_size=12),
+            )
+
+            # Axes styling
+            axis_style = dict(
+                gridcolor="#1e222d",
+                zerolinecolor="#1e222d",
+                tickfont=dict(color="#787b86", size=11),
+            )
+            fig.update_xaxes(**axis_style)
+            fig.update_yaxes(**axis_style, tickprefix="$")
+            fig.update_yaxes(tickprefix="", row=2, col=1)
+
+            # Crosshair
+            fig.update_layout(
+                xaxis=dict(showspikes=True, spikecolor="#787b86",
+                           spikethickness=1, spikedash="dot"),
+                yaxis=dict(showspikes=True, spikecolor="#787b86",
+                           spikethickness=1, spikedash="dot"),
+            )
+
+            with chart_placeholder:
+                st.plotly_chart(fig, use_container_width=True, config={
+                    "displaylogo": False,
+                    "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+                    "scrollZoom": True,
+                })
+
+            # ── Status bar ─────────────────────────────────────────────────────
+            last_ts = df.index[-1].strftime("%b %d %Y %H:%M")
+            st.caption(
+                f"Last candle: {last_ts} ET  ·  "
+                f"{len(df)} bars  ·  "
+                f"O {df['Open'].iloc[-1]:.2f}  "
+                f"H {df['High'].iloc[-1]:.2f}  "
+                f"L {df['Low'].iloc[-1]:.2f}  "
+                f"C {df['Close'].iloc[-1]:.2f}  "
+                f"Vol {df['Volume'].iloc[-1]:,.0f}"
+            )
+
+    # ── Auto-refresh ───────────────────────────────────────────────────────────
+    if auto_refresh:
+        time.sleep(30)
+        st.rerun()

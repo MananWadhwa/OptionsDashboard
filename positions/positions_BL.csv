@@ -1,2 +1,7 @@
 Ticker,ExpirationYYMMDD,OptionType,Strike,Side,Quantity,Entry_Price,Target_Price,SpreadId,Spread_Target
-ORCL,260529,P,155.0,Short,1,6.53,2.0,,
+MSFT,260508,C,415.0,Short,1,3.27,,,
+MSFT,260618,C,430.0,Short,1,11.0,1.0,,
+MSFT,260515,C,420.0,Short,1,11.0,1.0,,
+MSFT,260515,C,420,Short,1,9.14,,MSFT_PCS_RH,5
+MSFT,260508,C,415,Long,1,0.79,,MSFT_PCS_RH,
+
