@@ -1,3 +1,2 @@
 Ticker,ExpirationYYMMDD,OptionType,Strike,Side,Quantity,Entry_Price,Target_Price,SpreadId,Spread_Target
-MSFT,260618,C,430.0,Short,1,11.0,11.0,,
-MSFT,260515,C,420.0,Short,1,11.0,1.0,,
+MSFT,260618,C,430.0,Short,1,11.0,2.70,,
