@@ -447,6 +447,38 @@ def save_account_to_file(all_positions_df, account):
     out['Spread_Target'] = out['Spread_Target'].fillna('')
     out.to_csv(filepath, index=False)
 
+ROTATIONS_FILE = "positions/rotations.csv"
+ROTATIONS_COLS = ['id', 'name', 'from_ticker', 'from_qty', 'to_ticker', 'to_qty', 'target_gain_pct', 'notes']
+
+@st.cache_data
+def load_rotations(mtime=0):
+    if not os.path.exists(ROTATIONS_FILE):
+        return pd.DataFrame(columns=ROTATIONS_COLS)
+    df = pd.read_csv(ROTATIONS_FILE, comment='#')
+    for col in ROTATIONS_COLS:
+        if col not in df.columns:
+            df[col] = ''
+    df['from_qty']        = pd.to_numeric(df['from_qty'],        errors='coerce').fillna(0)
+    df['to_qty']          = pd.to_numeric(df['to_qty'],          errors='coerce').fillna(0)
+    df['target_gain_pct'] = pd.to_numeric(df['target_gain_pct'], errors='coerce').fillna(5.0)
+    return df.reset_index(drop=True)
+
+def save_rotations(df):
+    out = df.copy()
+    out[ROTATIONS_COLS].to_csv(ROTATIONS_FILE, index=False)
+
+@st.cache_data(ttl=60)
+def fetch_rotation_prices(tickers_tuple):
+    """Live spot prices for rotation tickers. Cached 60 s."""
+    prices = {}
+    for ticker in tickers_tuple:
+        try:
+            price, _ = get_latest_price(ticker)
+            prices[ticker] = price
+        except Exception:
+            prices[ticker] = 0.0
+    return prices
+
 @st.cache_data(ttl=3600)
 def parse_portfolio_pdfs():
     """Parse Robinhood portfolio statement PDFs from positions/portfolio/."""
@@ -867,10 +899,11 @@ if _active_tab == "Portfolio":
                 spread_target = group['Spread_Target'].dropna().iloc[0] if not group['Spread_Target'].dropna().empty else 0
 
                 ticker = group['Ticker'].iloc[0]
-                exp = group['ExpirationYYMMDD'].iloc[0]
-                strikes = "/".join(map(str, sorted(group['Strike'].astype(int).tolist())))
                 opt_type = group['OptionType'].iloc[0]
-                spread_name = f"{ticker} {exp} {strikes}{opt_type}"
+                exps_unique = sorted(group['ExpirationYYMMDD'].astype(str).unique().tolist())
+                exp_str = "/".join(exps_unique)
+                strikes = "/".join(map(str, sorted(group['Strike'].astype(int).tolist())))
+                spread_name = f"{ticker} {exp_str} {strikes}{opt_type}"
 
                 pnl = (net_entry_price - net_current_price) * 100 * group['Quantity'].iloc[0]
 
@@ -1178,6 +1211,172 @@ if _active_tab == "Portfolio":
             pf_countdown.empty()
             fetch_option_data.clear()
             st.rerun()
+
+    # --- ROTATION SHEET ---
+    _rot_mtime = os.path.getmtime(ROTATIONS_FILE) if os.path.exists(ROTATIONS_FILE) else 0
+    _rotations = load_rotations(mtime=_rot_mtime)
+    if not _rotations.empty:
+        st.divider()
+        st.markdown(
+            '<div style="font-size:1em;font-weight:700;color:#e2e8f0;padding:2px 0 10px;">Rotation Targets</div>',
+            unsafe_allow_html=True
+        )
+        _rot_tickers = tuple(sorted(set(
+            _rotations['from_ticker'].str.upper().tolist() +
+            _rotations['to_ticker'].str.upper().tolist()
+        )))
+        _rot_prices = fetch_rotation_prices(_rot_tickers)
+
+        _rot_card_cols = st.columns(min(2, len(_rotations)))
+        for _ri, (_, _rot) in enumerate(_rotations.iterrows()):
+            _from_t     = str(_rot['from_ticker']).upper()
+            _to_t       = str(_rot['to_ticker']).upper()
+            _from_qty   = float(_rot['from_qty'])      # QQQ shares sold
+            _to_qty     = float(_rot['to_qty'])        # MSFT shares bought
+            _gpct       = float(_rot['target_gain_pct'])
+            _to_price   = _rot_prices.get(_to_t,   0.0)
+            _from_price = _rot_prices.get(_from_t, 0.0)
+
+            # Target: enough MSFT value to buy back (from_qty × (1 + gpct/100)) shares of QQQ
+            _tgt_from_qty = _from_qty * (1 + _gpct / 100)
+            _tgt_val      = _tgt_from_qty * _from_price   # dollars needed at current QQQ price
+            _cur_val      = _to_qty * _to_price            # current MSFT value
+
+            # Current QQQ equivalent
+            _qqq_now  = _cur_val  / _from_price if _from_price > 0 else 0.0
+            _qqq_more = _qqq_now  - _from_qty
+
+            # Progress toward buying back target QQQ qty
+            _progress = (_cur_val / _tgt_val * 100) if _tgt_val > 0 else 0.0
+            _progress = max(0.0, min(100.0, _progress))
+            _shortfall_qty = max(0.0, _tgt_from_qty - _qqq_now)   # QQQ shares still needed
+
+            # MSFT price needed to hit target (at current QQQ price)
+            _tgt_to_price  = _tgt_val / _to_qty if _to_qty > 0 else 0.0
+            _to_price_diff = _tgt_to_price - _to_price
+
+            # Cash left over after buying back exactly from_qty shares at current price
+            _buyback_cost   = _from_qty * _from_price
+            _cash_delta     = _cur_val - _buyback_cost
+            _cash_delta_color = '#22c55e' if _cash_delta >= 0 else '#f87171'
+
+            _val_color      = '#22c55e' if _qqq_more >= 0 else '#f87171'
+            _border_color   = '#22c55e' if _progress >= 100 else '#3B82F6'
+            _bar_color      = '#22c55e' if _progress >= 100 else '#3B82F6'
+            _tgt_price_color = '#22c55e' if _to_price >= _tgt_to_price else '#f59e0b'
+
+            _badge = (
+                '<span style="background:#22c55e;color:#000;font-size:0.6em;padding:2px 7px;'
+                'border-radius:4px;font-weight:bold;">TARGET REACHED</span>'
+            ) if _progress >= 100 else ''
+            _rot_notes = str(_rot.get('notes', ''))
+            _notes_html = (
+                f'<div style="color:#6B7280;font-size:0.65em;margin-top:6px;">{_rot_notes}</div>'
+            ) if _rot_notes and _rot_notes not in ('', 'nan') else ''
+
+            _card = (
+                f'<div style="border:1.5px solid {_border_color};border-radius:12px;padding:14px;'
+                f'background:rgba(59,130,246,0.04);margin-bottom:8px;">'
+
+                # Header
+                f'<div style="display:flex;justify-content:space-between;align-items:flex-start;">'
+                f'<div>'
+                f'<div style="font-size:0.9em;font-weight:700;color:#e2e8f0;">{_rot["name"]}</div>'
+                f'<div style="font-size:0.72em;color:#9CA3AF;margin-top:2px;">'
+                f'<span style="color:#60A5FA;">{_to_qty:g} {_to_t}</span>'
+                f' &rarr; target <span style="color:#C084FC;">{_tgt_from_qty:.2f} {_from_t}</span>'
+                f'&nbsp;<span style="color:#6B7280;">(sold {_from_qty:g} × {1 + _gpct/100:.2f})</span>'
+                f'</div></div>'
+                f'<div>{_badge}</div>'
+                f'</div>'
+
+                # Metrics row
+                f'<div style="display:flex;gap:20px;margin-top:10px;flex-wrap:wrap;">'
+                f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Sold ({_from_t})</div>'
+                f'<div style="color:#9CA3AF;font-size:0.82em;font-weight:600;">{_from_qty:g} sh</div></div>'
+                f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Holding ({_to_t})</div>'
+                f'<div style="color:#60A5FA;font-size:0.82em;font-weight:600;">{_to_qty:g} sh @ ${_to_price:.2f}</div></div>'
+                f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">{_to_t} Value</div>'
+                f'<div style="color:#e2e8f0;font-size:0.82em;font-weight:600;">${_cur_val:,.2f}</div></div>'
+                f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">{_to_t} Target Price</div>'
+                f'<div style="color:{_tgt_price_color};font-size:0.82em;font-weight:600;">'
+                f'${_tgt_to_price:.2f} <span style="font-size:0.85em;opacity:0.8;">({_to_price_diff:+.2f})</span></div></div>'
+                f'</div>'
+
+                # Progress bar
+                f'<div style="margin-top:12px;">'
+                f'<div style="width:100%;background:#1F2937;border-radius:4px;height:8px;overflow:hidden;">'
+                f'<div style="width:{_progress:.1f}%;background:{_bar_color};border-radius:4px;height:8px;"></div>'
+                f'</div>'
+                f'<div style="color:#6B7280;font-size:0.65em;margin-top:4px;">'
+                f'{_progress:.1f}% &nbsp;&middot;&nbsp; need {_shortfall_qty:.2f} more {_from_t} (@ ${_from_price:.2f})'
+                f'</div></div>'
+
+                # QQQ equivalent row
+                f'<div style="display:flex;gap:20px;margin-top:10px;flex-wrap:wrap;">'
+                f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">{_from_t} equiv. now</div>'
+                f'<div style="color:{_val_color};font-size:0.82em;font-weight:600;">'
+                f'{_qqq_now:.2f} sh ({_qqq_more:+.2f} vs sold)</div></div>'
+                f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Target ({_from_t})</div>'
+                f'<div style="color:#C084FC;font-size:0.82em;font-weight:600;">'
+                f'{_tgt_from_qty:.2f} sh (+{_gpct:.1f}% · ${_tgt_val:,.2f})</div></div>'
+                f'<div><div style="color:#6B7280;font-size:0.6em;text-transform:uppercase;">Cash Delta (buy back {_from_qty:g} {_from_t})</div>'
+                f'<div style="color:{_cash_delta_color};font-size:0.82em;font-weight:600;">'
+                f'{_cash_delta:+,.2f} <span style="color:#6B7280;font-size:0.82em;">(val ${_cur_val:,.0f} − cost ${_buyback_cost:,.0f})</span>'
+                f'</div></div>'
+                f'</div>'
+
+                f'{_notes_html}'
+                f'</div>'
+            )
+            with _rot_card_cols[_ri % len(_rot_card_cols)]:
+                st.markdown(_card, unsafe_allow_html=True)
+
+    with st.expander("Manage Rotation Targets", expanded=_rotations.empty):
+        _rt_add, _rt_del = st.tabs(["Add", "Delete"])
+        with _rt_add:
+            with st.form("add_rotation_form"):
+                _rc1, _rc2 = st.columns(2)
+                _rot_name_in  = _rc1.text_input("Name / label", placeholder="MSFT-QQQ-BETA").strip()
+                _rot_notes_in = _rc2.text_input("Notes (optional)").strip()
+                _rc3, _rc4, _rc5, _rc6, _rc7 = st.columns(5)
+                _rot_from_in     = _rc3.text_input("Sold ticker", placeholder="QQQ").strip().upper()
+                _rot_from_qty_in = _rc4.number_input("Shares sold", min_value=0.0, step=0.001, value=0.0, format="%.3f")
+                _rot_to_in       = _rc5.text_input("Bought ticker", placeholder="MSFT").strip().upper()
+                _rot_to_qty_in   = _rc6.number_input("Shares bought", min_value=0.0, step=0.001, value=0.0, format="%.3f")
+                _rot_tpct_in     = _rc7.number_input("Target %", min_value=0.1, step=0.5, value=5.0)
+                if st.form_submit_button("Add Rotation"):
+                    if not _rot_name_in or not _rot_from_in or not _rot_to_in:
+                        st.error("Name, sold ticker, and bought ticker are required.")
+                    else:
+                        _rots_ex = load_rotations(mtime=os.path.getmtime(ROTATIONS_FILE) if os.path.exists(ROTATIONS_FILE) else 0)
+                        _new_rid = int(_rots_ex['id'].max() + 1) if not _rots_ex.empty and _rots_ex['id'].notna().any() else 1
+                        _new_rot_row = {
+                            'id': _new_rid, 'name': _rot_name_in,
+                            'from_ticker': _rot_from_in, 'from_qty': _rot_from_qty_in,
+                            'to_ticker': _rot_to_in, 'to_qty': _rot_to_qty_in,
+                            'target_gain_pct': _rot_tpct_in, 'notes': _rot_notes_in,
+                        }
+                        save_rotations(pd.concat([_rots_ex, pd.DataFrame([_new_rot_row])], ignore_index=True))
+                        load_rotations.clear()
+                        st.success(f"Added rotation: {_rot_name_in}")
+                        st.rerun()
+        with _rt_del:
+            _rots_for_del = load_rotations(mtime=os.path.getmtime(ROTATIONS_FILE) if os.path.exists(ROTATIONS_FILE) else 0)
+            if _rots_for_del.empty:
+                st.info("No rotations to delete.")
+            else:
+                _rot_del_labels = [
+                    f"{r['name']} ({r['from_ticker']} ← {r['to_ticker']})"
+                    for _, r in _rots_for_del.iterrows()
+                ]
+                _rot_del_sel = st.selectbox("Select rotation", _rot_del_labels, key="rot_del_sel")
+                _rot_del_i   = _rot_del_labels.index(_rot_del_sel)
+                if st.button("Delete", type="primary", key="rot_del_btn"):
+                    _rots_for_del = _rots_for_del.drop(_rots_for_del.index[_rot_del_i]).reset_index(drop=True)
+                    save_rotations(_rots_for_del)
+                    load_rotations.clear()
+                    st.rerun()
 
     # --- MANAGE POSITIONS ---
     st.divider()
@@ -2474,25 +2673,15 @@ def fetch_ibit_approx():
     """Estimate current IBIT price using BTC-USD ratio (useful when market is closed)."""
     try:
         ibit = _yf_ticker("IBIT")
-        btc = _yf_ticker("BTC-USD")
-
         ibit_hist = ibit.history(period="5d", interval="1d")
-        btc_hist = btc.history(period="5d", interval="1d")
 
-        if ibit_hist.empty or btc_hist.empty:
+        if ibit_hist.empty:
             return {"error": "No data", "name": "IBIT ~", "approx": True}
 
         ibit_close = float(ibit_hist['Close'].iloc[-1])
 
-        # Match BTC close to last IBIT trading day
-        ibit_last_date = ibit_hist.index[-1].date()
-        btc_same_day = btc_hist[[d.date() == ibit_last_date for d in btc_hist.index]]
-        btc_close = float(btc_same_day['Close'].iloc[-1]) if not btc_same_day.empty else float(btc_hist['Close'].iloc[-1])
-
-        ratio = ibit_close / btc_close  # IBIT price per $1 of BTC
-
         btc_current, _ = get_latest_price("BTC-USD")  # cached 60 s
-        approx_price = ratio * btc_current
+        approx_price = btc_current / 1764
         change = approx_price - ibit_close
         change_pct = (change / ibit_close * 100) if ibit_close else 0
 

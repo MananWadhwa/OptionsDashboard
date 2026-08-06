@@ -1,2 +1,4 @@
 Ticker,ExpirationYYMMDD,OptionType,Strike,Side,Quantity,Entry_Price,Target_Price,SpreadId,Spread_Target
-SNAP,260618,C,7.0,Short,6,0.27,0.03,,
+SNAP,260821,C,7.0,Short,6,0.27,0.03,,
+BABA,260821,C,125.0,Short,1,2.61,0.54,,
+META,260918,C,650.0,Short,1,14,3.50,,

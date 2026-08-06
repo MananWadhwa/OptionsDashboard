@@ -1,5 +1,4 @@
 Ticker,ExpirationYYMMDD,OptionType,Strike,TargetPrice,Intent,Label,ItemType
-NVDA,260515.0,C,190.0,1.8,buy,RH-IRA-Buy-Close,option
 MSFT,,,,,buy,,stock
 META,,,,,buy,,stock
 NVDA,,,,,buy,,stock
@@ -8,7 +7,7 @@ NKE,,,,,buy,,stock
 PYPL,,,,,buy,,stock
 NOW,,,,,buy,,stock
 FREL,,,,,buy,,stock
-LULU,260515.0,C,160.0,3.6,sell,RH-Reopen,option
+LULU,260618.0,C,160.0,3.6,sell,RH-Reopen,option
 LULU,,,,175.0,sell,,stock
 ORCL,,,,170.0,sell,,stock
 IBIT,,,,,buy,,stock
@@ -19,10 +18,7 @@ JD,,,,,buy,,stock
 PYPL,,,,,buy,,stock
 IBIT,260529.0,C,50.0,2.0,sell,IBIT-FD-TI Sell,option
 NFLX,,,,90.0,buy,,stock
-NFLX,260618.0,P,90.0,3.15,sell,,option
 QQQ,,,,,buy,,stock
-IBIT,260529.0,C,50.0,0.54,sell,,option
 GOOG,,,,,buy,,stock
-MSFT,260618.0,C,450.0,11.0,sell,,option
 PYPL,260618.0,C,52.5,1.2,sell,,option
-NOW,260618.0,P,90,5.4,sell,,option
+VXUS,,,,,buy,,stock
